@@ -96,7 +96,8 @@ export function resolveConfig(config) -> ResolvedConfig
 | `digestMaxOutputTokens` | number | `3000` | `digestMaxOutputTokens` |
 | `digestProvider` | string | `''` | `digestProvider` |
 | `digestModel` | string | `''` | `digestModel` |
-| `injectIntoSubagents` | boolean | `true` | `injectIntoSubagents` |
+| `injectIntoSubagents` | boolean | `false` | `injectIntoSubagents` |
+| `compactionRecall` | boolean | `true` | `compactionRecall` |
 
 `resolveConfig(config)` 必须：
 - 接受 `undefined`/`null`/非对象，回退全默认值。
@@ -1062,3 +1063,80 @@ if (deps.isEnabled?.() === false) return decision
 
 **基线**：v2 的 263 个既有用例一个都不许挂；因 `digestSettings` 扩了 `enabled` 而必须同步
 更新的既有断言，只允许改 `test/routes.test.js` 内的期望值。
+
+## V3.8 词法检索、压缩补偿与子代理默认值
+
+### 检索：`lib/core/search.js`（新增纯函数模块）
+
+`memory` 工具的 `search` 不再是整串子串匹配。三个导出，全部无 IO、无宿主依赖：
+
+- `queryTerms(query)`：NFKC 折叠 → `[\p{L}\p{N}_-]+` 词元 → 连续汉字再补相邻
+  二元组；长度 ≤ 1 的词元丢弃；总数截 64；非字符串返回 `[]`。
+- `scoredLines(content, terms, limit)`：按**条目块**聚合打分。行角色权重
+  标题 4 / 条目头 2 / 正文 1，乘以块内命中的去重词元数；多词元查询要求块内
+  命中 ≥ 2 才入选，用来刷掉二元组的单点噪音。
+- `literalLines(content, needle, limit)`：切不出词元时（单字、纯符号）的整串
+  子串兜底，行为与升级前一致。
+
+`lib/host/tools.js` 只有 `doSearch` 与顶部 import 变动；输出形态不变
+（`- [scope:line] text`），`matches` 多一个 `score` 字段。四个分区改为**全局按
+分数排序后再截 `MAX_MATCHES = 40`**，否则先扫的分区会被噪音占满名额。
+
+### 压缩补偿：`lib/host/inject.js`
+
+宿主一次成功压缩连写三条事件：`compaction/start`、`compaction/summary`（携带
+`shadowedRange` / `shadowedSeqs`）、以及一条 `source.kind === 'compact-checkpoint'`
+的 `user/message`，用 `surfaceOp: replace` 替换整段区间。被吞节点从
+`surface.nodes` 彻底消失，但事件仍留在 append-only 日志里——**判存活看 surface，
+判发生过压缩看日志，缺一不可**。
+
+- 新增导出 `compactionState(session) => { seq: number, shadowed: Set<number> }`：
+  `seq` 是最后一条 `compaction/summary` 的 seq（从未压缩过为 `-1`），`shadowed`
+  是全部 `compaction/*` 的 `shadowedSeqs` 并集；整体 try/catch，读盘失败降级为
+  `{ seq: -1, shadowed: ∅ }`。
+- `lastSnapshotEvent(session, shadowed?)` 新增**可选**第二参，旧调用零影响。
+  surface 可用时行为完全不变；surface 不可用时改用遮蔽集排除，替掉原先
+  「一律返回 true」的退路。**不收紧这一条会造成永久失忆**：被压缩吞掉的旧快照
+  被当作存活，digest 又与本轮一致，于是永远命中「内容未变不重复写入」。
+- `needsResync = recallEnabled && (old === undefined ? compaction.seq >= 0
+  : compaction.seq > old.seq)`；命中时即使 digest 相同也重写。重写产生的新 seq
+  必然大于压缩 seq，判定自动收敛，**无新压缩时只写一次**。
+- 补偿只重写既有快照：正文与 digest 逐字节不变，**不往记忆里掺「上下文已压缩」
+  这类提示**（进了正文要么污染 digest 造成抖动，要么让正文与 digest 语义分叉）。
+- 已知残留风险（改动前后同级）：surface 不可用时 `replaceSnapshot` 传的
+  `old.seq` 可能已不在 surface 上，会被宿主拒并降级为一条 warn，那一轮不注入。
+  不用 append 兜底是刻意的——那会让 surface 上出现两条快照，违背「恒一条」。
+
+### 子代理默认值反转：`injectIntoSubagents` true → `false`
+
+**两处门控，缺一不可**（实测踩过：只改 pre-step 会留下半开状态）：
+
+- 记忆快照：`agent/pre-step` 里 `config.injectIntoSubagents === false &&
+  deps.isSubagent(agent)` → 跳过写入。（这条早就存在，只是默认值是 true。）
+- 人格 section：`prompt.section({ text })` 的回调此前写成 `text: () => {...}`，
+  把入参整个丢掉了，于是**人格与画像对所有 agent 一视同仁**，子代理照样带着
+  人格跑。现改为 `text: (assembly) => {...}`，用 `assembly?.agent` 走与 pre-step
+  **完全相同**的判定条件。`assembly?.agent` 为空（非 agent 触发的组装，如会话
+  标题生成）时保守视为非子智能体，保持注入。
+  ⚠️ `AssembleContext` 的类型声明只列了 `scope` / `signal`，**不要据此断定
+  回调拿不到 agent** —— 运行时带，参照实现就是读 `assembly?.agent`。
+
+默认值本身要**四处一起改**，漏任何一处都不生效或测试挂：
+
+1. `lib/host/config.js` 的 zod `.default()` 与 DEFAULTS 冻结常量（**两处必须一致**）。
+2. `cordis.patch.yml` 写**显式 `injectIntoSubagents: false`**。实测本机 web profile 的
+   配置树里从未落过 supermemory 的 config 段（`grep 'id: supermemory'
+   ~/.dsh/profiles/web/cordis.patch.yml` 无命中；安装走 profile `package.json` 的
+   `link:` + include 列表，配置每次从**包内** patch 读取）。所以删掉这行同样会走
+   新默认值，并不会被残留的 `true` 压住——「patch insert 语义会残留旧值」这个推断在
+   本机的 link 安装方式下**不成立**。保留显式 `false` 的真正理由是：让默认值反转在
+   配置文件里可见，不要求读者去翻 zod 默认；若日后改成复制到 profile 的安装方式，
+   显式 `false` 也依然是更安全的那一侧。
+3. `test/paths-document.test.js` 的 defaults 常量与「非布尔回退默认」期望值。
+4. `lib/client.js` 设置页配置示例文案（仅那一行字符串）。
+
+新增配置 `compactionRecall`（布尔，默认 `true`，`.volatile()`），门控写
+`config.compactionRecall !== false`，缺失视为开启——沿用 §V3.4 的判定铁律。
+
+**基线**：344 个用例全绿（v3 的 304 + `search.test.js` 23 + `compaction-recall.test.js`
+10 + 子代理默认值 5）。既有用例只允许改期望值，不许删。

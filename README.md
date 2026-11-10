@@ -22,6 +22,7 @@
 | 整理模型可选 | 面板里从已配置模型中选择整理用的模型，或跟随当前会话 |
 | `memory` 工具 | Agent 可 list / read / search / append / replace / digest |
 | 预算降级 | 记忆超预算时自动降级为「索引 + 摘要」，不会无限膨胀提示词 |
+| 压缩补偿 | 上下文被压缩摘要覆盖后，下一轮自动重写完整记忆快照；digest 不变、不会多出第二条 |
 
 ## 写入策略（v2 起）
 
@@ -113,6 +114,13 @@ $DSH_HOME/supermemory/
 - 四段合并字节超 `injectMaxBytes` 时，改为输出索引（每文件标题、一级小节、
   更新时间、字节数）+ 一行「完整内容可用 memory 工具按需读取。」
 
+**压缩之后**：宿主压缩会写一条 checkpoint，用 `surfaceOp: replace` 把整段
+surface 区间换掉，本插件的快照可能被一起吞掉。因此每轮 pre-step 都做一次
+重同步判定——快照已不在 surface 上，或最近一次压缩晚于快照，就重写一条。
+重写后的正文与 digest **逐字节不变**，不往记忆里掺「上下文已压缩」这类提示；
+收敛后不会反复重写。快照存活判定优先看 `session.surface.nodes`，拿不到时
+按压缩事件的 `shadowedSeqs` 排除，两者都没有才退回日志顺序。
+
 ## 配置
 
 在 `cordis.patch.yml` 的 `supermemory` 行里改；全部字段 `.volatile()`，设置页改动即时生效。
@@ -132,7 +140,8 @@ $DSH_HOME/supermemory/
 | `digestMaxOutputTokens` | `3000` | 整理输出上限 |
 | `digestProvider` / `digestModel` | 空 | 默认整理模型；面板里选的值优先 |
 | `digestWritableScopes` | `['project']` | 整理可写的分区（v2 硬限制为 `project`） |
-| `injectIntoSubagents` | `true` | 子智能体是否带记忆 |
+| `injectIntoSubagents` | `false` | 子智能体是否带记忆；默认**不带**，需要时显式配 `true` |
+| `compactionRecall` | `true` | 压缩后快照自愈与补偿重写；`false` 退回「仅内容变化才重写」 |
 
 > 旧字段名 `presetsRoot` 仍被接受，等价于 `personasRoot`。
 
@@ -145,7 +154,7 @@ $DSH_HOME/supermemory/
 |---|---|
 | `action` | `list` / `read` / `search` / `append` / `replace` / `digest` |
 | `scope` | `soul` / `user` / `global` / `project` |
-| `query` | `search` 时必填，关键词或简单正则 |
+| `query` | `search` 时必填，检索词；自动分词并补中文相邻二元组，按相关性排序。不支持正则 |
 | `content` | `append` / `replace` 时必填 |
 | `reason` | 写入原因，写进条目元数据 |
 | `confirmSoul` | 写 `soul` 时必须为 `true`；否则返回 `SOUL_CONFIRM_REQUIRED` |
@@ -166,7 +175,8 @@ $DSH_HOME/supermemory/
 
 ## 已知边界
 
-- 不做向量/embedding 语义检索（纯 md + 关键词/全文）。
+- 不做向量/embedding 语义检索（纯 md + 词法检索；中文按相邻二元组近似分词）。
+- 压缩补偿只重发快照，不改写压缩摘要，也不保证摘要本身保留了记忆内容。
 - 不做文件版本历史与回滚。
 - 不做敏感信息过滤。
 - 不跨机器同步，不做记忆导入导出。
@@ -175,7 +185,7 @@ $DSH_HOME/supermemory/
 ## 开发
 
 ```bash
-node --test          # 全部单测（263 个用例）
+node --test          # 全部单测（344 个用例）
 ```
 
 `test/` 下按模块分组：
@@ -188,6 +198,9 @@ node --test          # 全部单测（263 个用例）
 | `host-install.test.js` | 注入链路、memory 工具、soul 写保护、斜杠命令 |
 | `routes.test.js` | HTTP 路由、models/settings/personas、STALE 冲突、整理器 |
 | `injection-trigger.test.js` | 自动整理触发（轮数 / 压力 / 负向拦截）+ 只写 project |
+| `compaction-recall.test.js` | 压缩遮蔽识别、快照重建、防抖动、开关对照 |
+| `search.test.js` | 分词与中文二元组、块聚合打分、排序截断、字面兜底 |
+| `client-toggle.test.js` | 面板总开关前端态 |
 | `trust-fence.test.js` | 信任栅栏五维矩阵 |
 
 本地跑测试需要 `@deepseek-ai/schemastery`（唯一宿主依赖，仅 `lib/host/config.js` 使用）。

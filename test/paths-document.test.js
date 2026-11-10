@@ -347,7 +347,8 @@ describe('resolveConfig', () => {
     digestWritableScopes: ['project'],
     digestProvider: '',
     digestModel: '',
-    injectIntoSubagents: true,
+    injectIntoSubagents: false,
+    compactionRecall: true,
   }
 
   test('undefined / null / 非对象 → 全默认', () => {
@@ -426,10 +427,17 @@ describe('resolveConfig', () => {
   })
 
   test('非布尔布尔字段回退默认', () => {
-    const resolved = resolveConfig({ enabled: 'yes', autoDigest: 0, injectIntoSubagents: null })
+    const resolved = resolveConfig({
+      enabled: 'yes',
+      autoDigest: 0,
+      injectIntoSubagents: null,
+      compactionRecall: 'nope',
+    })
     assert.equal(resolved.enabled, true)
     assert.equal(resolved.autoDigest, true)
-    assert.equal(resolved.injectIntoSubagents, true)
+    // injectIntoSubagents 默认 false（子智能体默认不带记忆）；compactionRecall 默认 true。
+    assert.equal(resolved.injectIntoSubagents, false)
+    assert.equal(resolved.compactionRecall, true)
   })
 
   test('非字符串字符串字段回退默认，空串合法', () => {

@@ -16,4 +16,7 @@
         autoDigest: true
         digestEveryTurns: 5
         digestPressureRatio: 0.75
-        injectIntoSubagents: true
+        # 子智能体默认不带记忆：必须显式写 false。
+        # patch 是 insert 语义，不会撤销上一次已落进 profile 的旧值，
+        # 删掉这行会让残留的 true 继续生效。
+        injectIntoSubagents: false

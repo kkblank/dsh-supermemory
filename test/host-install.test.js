@@ -507,6 +507,38 @@ test('子智能体在 injectIntoSubagents=false 时跳过注入', async (t) => {
   assert.equal(h.session.pluginSnapshots().length, 1)
 })
 
+test('injectIntoSubagents 默认即 false：不传配置时子智能体也不注入', async (t) => {
+  // 默认值断言：makeHarness 未传 injectIntoSubagents，resolveConfig 应填 false。
+  const h = await makeHarness()
+  t.after(h.cleanup)
+  assert.equal(resolveConfig({}).injectIntoSubagents, false, '默认应为 false')
+  await h.store.appendEntries(
+    { kind: 'global', presetId: 'default' },
+    [{ time: '2026-11-10T10:00:00.000Z', source: 'user-request', body: '有效内容' }],
+  )
+  t.after(installInjection(h.ctx, h.deps))
+
+  await runPreStep(h.ctx, { ...h.agent, isSubagent: true })
+  assert.equal(h.session.allPluginEvents().length, 0, '默认配置下子智能体不得注入')
+
+  // 同一夹具里主智能体正常注入，证明跳过只作用于子智能体。
+  await runPreStep(h.ctx, h.agent)
+  assert.equal(h.session.pluginSnapshots().length, 1)
+})
+
+test('显式 injectIntoSubagents=true 时子智能体仍注入（保留旧能力）', async (t) => {
+  const h = await makeHarness({ config: { injectIntoSubagents: true } })
+  t.after(h.cleanup)
+  await h.store.appendEntries(
+    { kind: 'global', presetId: 'default' },
+    [{ time: '2026-11-10T10:00:00.000Z', source: 'user-request', body: '有效内容' }],
+  )
+  t.after(installInjection(h.ctx, h.deps))
+
+  await runPreStep(h.ctx, { ...h.agent, isSubagent: true })
+  assert.equal(h.session.pluginSnapshots().length, 1, '显式开启后子智能体应注入')
+})
+
 test('signal.aborted / reject 决策：不注入且原样返回 decision', async (t) => {
   const h = await makeHarness()
   t.after(h.cleanup)
@@ -585,6 +617,42 @@ test('人格 section：读活动 scope 的缓存，无 scope 时返回空串', a
   assert.ok(text.includes('人格 (soul)'))
   assert.ok(text.includes('简洁的中文助手'))
   assert.ok(text.includes('用户偏好深色主题'))
+})
+
+test('人格 section：子智能体默认不注入（text 入参带 agent 的门控）', async (t) => {
+  const h = await makeHarness()
+  t.after(h.cleanup)
+  await h.store.writeDoc(
+    { kind: 'soul', presetId: 'default' },
+    '# 人格\n\n你是简洁的中文助手。\n',
+  )
+  t.after(installInjection(h.ctx, h.deps))
+  await runPreStep(h.ctx, h.agent)
+
+  const section = h.sections[0]
+  assert.equal(section.name, 'supermemory:persona')
+
+  // 默认 injectIntoSubagents=false：子智能体拿不到人格，主智能体照常拿到。
+  assert.equal(section.text({ agent: { ...h.agent, isSubagent: true } }), '')
+  assert.ok(section.text({ agent: h.agent }).includes('简洁的中文助手'))
+
+  // 入参没有 agent（非 agent 触发的组装，如会话标题生成）保守视为非子智能体。
+  assert.ok(section.text({}).includes('简洁的中文助手'))
+  assert.ok(section.text(undefined).includes('简洁的中文助手'))
+})
+
+test('人格 section：显式 injectIntoSubagents=true 时子智能体照常注入', async (t) => {
+  const h = await makeHarness({ config: { injectIntoSubagents: true } })
+  t.after(h.cleanup)
+  await h.store.writeDoc(
+    { kind: 'soul', presetId: 'default' },
+    '# 人格\n\n你是简洁的中文助手。\n',
+  )
+  t.after(installInjection(h.ctx, h.deps))
+  await runPreStep(h.ctx, h.agent)
+
+  const section = h.sections[0]
+  assert.ok(section.text({ agent: { ...h.agent, isSubagent: true } }).includes('简洁的中文助手'))
 })
 
 test('服务缺失时静默降级：无 systemPrompt / 无 tools / 无 commands 都返回空 dispose', async (t) => {
