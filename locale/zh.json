@@ -85,11 +85,20 @@
     "personaCancel": "取消",
     "personaCreateFailed": "创建人设失败：{error}",
     "personaSwitched": "已切换人设。",
+    "personaRename": "重命名",
+    "personaRenamed": "已重命名人设。",
+    "personaRenameFailed": "重命名人设失败：{error}",
+    "personaDelete": "删除人设",
+    "personaDeleteConfirm": "确定删除「{name}」及其人格、画像与全局记忆？此操作不可撤销。",
+    "personaDeleted": "已删除人设及其记忆文件。",
+    "personaDeleteFailed": "删除人设失败：{error}",
+    "personaDeleteLocked": "Default 人设不能删除。",
     "digest": {
       "model": "整理模型",
       "modelFollow": "跟随当前会话",
       "modelSaved": "整理模型已保存。",
-      "modelSaveFailed": "保存整理模型失败：{error}"
+      "modelSaveFailed": "保存整理模型失败：{error}",
+      "consolidation": "整编：写入 {added} · 合并 {merged} · 移除 {dropped} · 保留 {kept}"
     },
     "projectAuto": "已从工作区自动同步。"
   }

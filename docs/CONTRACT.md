@@ -1361,3 +1361,413 @@ record.consolidation = {
 `test/document-entry-id.test.js`、`test/consolidate-core.test.js`（id 往返与对账）、
 `test/consolidate-input.test.js`（提示与输入预算）、`test/store-snapshot.test.js` 与
 `test/config-consolidate.test.js`（快照与配置）、`test/injection-trigger.test.js` 内的整编编排用例。
+
+---
+
+# v5 变更：人设的重命名与删除
+
+v2 起人设只能「切换」和「新增」。本节补上「重命名」与「删除」，并**逐项定义删除
+要牵连什么**——人设的删除不是删一个目录那么简单，注册表、进程内缓存、正在运行的
+会话注入都沾边，漏一项就会出现幽灵条目或旧记忆复活。
+
+## V5.0 三条产品决策（已与用户确认，不再讨论）
+
+| 决策 | 取定 | 理由 |
+|---|---|---|
+| 重命名是否改目录名（slug） | **只改显示名 `name`，slug 与磁盘目录不变** | 改 slug 会让在跑的会话注入路径突变、`history/` 快照错位、`runs.jsonl` 里记的旧 persona 对不上。收益只是「磁盘目录名好看」，不值。 |
+| 删除下限 | **默认人设永久禁删，判定为大小写不敏感 `slug.toLowerCase() === 'default'`**，其余可删到只剩它一个 | 正确的理由是：它是 `index.js` 唯一自动创建的人设、面板下拉里唯一恒在的条目。**不要**写成「Default 是 `resolveScope` / `personaKey` 的兜底键」——那些兜底键是小写 `default`，`Default` 不是任何地方的兜底键，两者详见本节末「已知缺陷」。 |
+| 删除可恢复性 | **直接 `rm -rf` 该人设目录**，不建回收目录 | 用户明确要求「都要删除」；界面用内联二次确认兜住误操作。 |
+
+两个新按钮都作用于**面板下拉当前选中的那个人设**（要改/删别的先切过去），
+不做多行管理列表——界面复杂度是本功能的第一约束。
+
+**边界：注册表里可能压根没有 `default` 条目。** `deletePersona` 守的是「不许删 slug 为
+`default` 的人设」，不是「列表里恒有 default」。真实运行下 `lib/index.js` 启动时会
+`createPersona('Default')` + `setCurrentPersona`，所以条目通常恒在；但只把 `personas/`
+目录拷到新机器、没有 `personas.json` 时，`reconcileRegistry` 只登记扫到的目录，
+**不会凭空补一条 default**。此时删掉最后一个非 default 人设会得到 `personas: []` +
+`current: null`——这不是 bug：注入回退 `'default'` 空模板，下一次启动 `index.js` 的初始化
+发现列表为空会重新补建 Default，可自愈。禁止把它"修"成删除时报错或凭空造条目。
+
+## V5.1 数据模型：不变
+
+`personas.json` 与 `personas/<slug>/` 的结构与 v2 完全一致（§V2.1），本节不新增字段、
+不改落盘形态。`name` 本来就只存在于注册表，重命名只是写它。
+
+## V5.2 存储层新增 API（`lib/core/store.js`）
+
+```js
+renamePersona(slug, name)
+  -> Promise<{ ok:true, persona:{ slug, name, createdAt, dir } }
+            | { ok:false, code:'BAD_INPUT'|'NOT_FOUND'|'UNWRITABLE', message }>
+deletePersona(slug)
+  -> Promise<{ ok:true, deleted:{ slug, name }, current:{ slug, name }|null }
+            | { ok:false, code:'BAD_INPUT'|'PERSONA_PROTECTED'|'NOT_FOUND'|'UNWRITABLE', message }>
+```
+
+两者都 `await ready`，都在 `enqueue(personasPath, ...)` 里跑，与 `createPersona` /
+`setCurrentPersona` 共用同一条注册表串行队列。
+
+**slug 一律「先查表，再拼路径」**：先在 `personasState.personas` 里**逐字**匹配，
+匹配不到直接 `NOT_FOUND`，**不做 `personaSlug()` 归一化**。这是安全要点——归一化会把
+`../../etc` 变成 `..-..-etc`，反而可能命中磁盘上真实存在的同名目录。查表匹配天然只
+能命中注册表里的人设，越界无从发生。
+
+### renamePersona 细则
+
+1. `name` 去空白、`[...name].slice(0, MAX_PERSONA_NAME)`（60 码点）；空 → `BAD_INPUT`。
+2. 只改 `entry.name`，`slug` / `createdAt` / 目录一概不动。
+3. `persistRegistry` 失败 → 把 `name` 改回原值再返回 `UNWRITABLE`（内存不留脏值）。
+4. **不写 `persona.json`**：`reconcileRegistry` 只在注册表缺该 slug 时才用目录元数据
+   重建 name，注册表有条目时该文件里的 `name` 不参与显示。多写一个文件只会多一个失败面。
+5. 返回的 `persona.dir` 仍是原目录（调用方据此知道「目录没动」）。
+
+### deletePersona 细则
+
+默认人设的禁删判定走 `isDefaultSlug(slug)`（`slug.toLowerCase() === 'default'`），
+放在**任何 IO 之前，包括 `await ready`**——这条判定不吃任何磁盘状态，禁删不该被迁移
+流程牵制（`ready` 里含迁移 IO）。之后按此顺序，
+原则是**宁可残留目录，也绝不留幽灵条目**：
+
+> **大小写铁律（一次真实事故换来的，勿退回逐字比较）**
+> 禁止用 `slug === 'default'` 判定默认人设。`personaSlug()` 原样保留 Unicode 字母的
+> 大小写，`createPersona('Default')` 产出的 slug 就是大写 `Default`；而 `personaKey()`
+> 的兜底值是小写 `'default'`。**两者不是同一个字符串**，逐字比小写在真实宿主上
+> 永远不命中——`DELETE /personas {"slug":"Default"}` 曾经真的删掉了默认人设。
+> `pickSuccessorCurrent` 里挑接班人的比较同样必须大小写不敏感，否则删掉当前人设后
+> 会跳过默认人设去选 `createdAt` 最早的那个。
+> **测试必须用真实大写 `Default`**：只测小写 `'default'` 的用例全绿也挡不住这个事故，
+> 这是本次缺陷活到真实验证阶段的直接原因。
+
+1. 查表匹配，无 → `NOT_FOUND`。
+2. 内存里摘条目 + 迁移 current → `persistRegistry`。写失败**立即返回 `UNWRITABLE`，
+   此时磁盘尚未被动过**，状态完全自洽。
+3. `rm(join(personasRoot, slug), { recursive:true, force:true })`。失败（`ENOENT` 除外）
+   → 把条目插回**原位置**、`current` 复原、再 `persistRegistry` 一次、返回 `UNWRITABLE`。
+4. `personasState` 指向新注册表。
+5. **清进程内缓存**：遍历 `cache.keys()`，删掉所有以 `<dir>/` 为前缀的条目。
+   **为什么必须清（实测结论，勿照抄成"重建同名 slug 的时序问题"）**：Store 有两条读路，
+   危险程度不同。`readDoc` → `readInner` 会先 `stat`，文件没了就顺手丢缓存，**自愈**；
+   而 `readDocSync` **压根不 stat，只读 cache**。人格与画像的 systemPrompt section
+   （`lib/host/inject.js` 的 `readBodySync`）走的正是 `readDocSync`，而 section 读的
+   `activeScope.persona` 在删除后到下一次 `loadScope` 之前仍是**已删的那个 slug**——
+   不清缓存，已删人设的人格会继续往 system prompt 里灌。
+   由此得到一条测试要求：**"漏清缓存"的回归用例必须打在 `readDocSync` 上**，
+   用 `readDoc` 断言的用例是抓不到这个 bug 的（它会自愈，永远绿）。
+
+**current 迁移顺序**（仅当被删的就是 current）：
+`'default'`（若在剩余列表里）→ 剩余里 `createdAt` 最早的一个 → `''`（注入回退 default 空模板）。
+
+### 删除的关联清理清单（逐项落实，这是本节的验收核心）
+
+| 对象 | 处理 |
+|---|---|
+| `personas/<slug>/` 整个目录（`soul.md` / `user.md` / `global-memory.md` / `persona.json` / `preset.json` / `history/` 全部快照） | ✅ 删除 |
+| `personas.json` | ✅ 移除条目；被删的是 current 时按上面的顺序迁移 |
+| store 进程内 `cache` | ✅ 删掉该目录下所有路径的条目 |
+| 正在运行会话的注入快照 | 🔄 **自动收敛，不写任何补偿代码**：下一轮 `agent/pre-step` 解析到新 persona，四段正文变 → `buildSnapshot` 的 digest 变 → `replace` 旧快照，surface 恒为一条。四段全空时走既有的 `EMPTY_DIGEST` 占位分支。 |
+| `runs.jsonl` | ⏸ 不改写。历史整理报告里的 `persona` 是既成事实记录，抹掉等于伪造历史。 |
+| `projects.json`、各项目 `.dsh/memory/project-memory.md` | ⏸ 不动。项目记忆跟人设无关（§V2.1）。 |
+| `deps.readActiveContext()` | ⏸ 陈旧到下一次 pre-step。面板只读它的 `projectRoot`，不读 persona，无可见影响。 |
+
+**已知边界（不是 bug，勿修）**：极端并发下（后台整理恰好正在写该目录），`rm` 之后
+目录可能被 `writeAtomic` 的 `mkdir` 重建为孤儿目录。注册表已无条目 ⇒ 面板不显示、
+注入不读取，只在下一次启动时被 `reconcileRegistry` 重新登记。为它加锁不划算。
+
+## V5.3 装配与访问层
+
+- `lib/index.js`：`deps.personas` 增加 `rename: (slug, name) => store.renamePersona(slug, name)`
+  与 `remove: (slug) => store.deletePersona(slug)`。
+- `lib/host/access.js`：`personaApi()` 用**同一个 `wrap` 工厂**加 `rename` / `remove` 两键，
+  装配层优先、回退 `store.renamePersona` / `store.deletePersona`（§V2.2 的双通道口径不变）。
+
+## V5.4 路由（`lib/host/routes-settings.js` 的 `handlePersonas`）
+
+| 方法 | path | body / query | 说明 |
+|---|---|---|---|
+| **PATCH** | `api/dsh-supermemory/personas` | `{ slug, name }` | 改显示名。`name` 复用 POST 那套校验（非空、≤60） |
+| **DELETE** | `api/dsh-supermemory/personas` | `{ slug }`，回退 `?slug=` | 删除人设及其全部记忆文件 |
+
+1. **响应体与 GET/POST/PUT 完全同构**：一律 `sendOk(res, await personasData())`，
+   即 `{ personas, current }`。客户端一处刷新逻辑通吃，不做专用响应形状。
+2. 错误映射：`BAD_INPUT`→400、`NOT_FOUND`→404、`PERSONA_PROTECTED`→409、其它→500。
+   `slug` 缺失 / 空白一律 400。取法上两者不同，是刻意的：`PATCH` 是「带正文的写」，
+   **只从 body 取 `slug`**；`DELETE` 允许 `body.slug` 回退 `?slug=`（空 body 经
+   `readJsonBody` 得到 `{}`，纯 query 形态因此可用）。不要把 PATCH 也放宽成读 query。
+   store 返回 `ok:false` 却没带 `code` 时，兜底码用 `PERSONA_RENAME_FAILED` /
+   `PERSONA_DELETE_FAILED`（照 POST 的 `PERSONA_CREATE_FAILED` 风格），状态 500。
+   这两个码只面向日志与排查，**不进 locale**——界面展示的是 `error` 文本。
+
+   **query 形态的 slug 必须百分号编码**（真实 node:http 实测，非推测）：请求行里出现
+   非 ASCII 字节会被 HTTP parser（llhttp）直接判非法，返回 **`400 Bad Request` 且
+   响应体为空，请求根本不进插件 handler**——curl 在这种情况下还是 `exit 0` + 空输出，
+   是个排障陷阱。编码形态 `?slug=%E4%B8%B4...` 实测 200 且目录真删。
+   `queryOf` 的 percent-decode 已验证逐字等值（中文码点原样传到 store 参与查表）。
+   **禁止给 DELETE 分支加 `decodeURIComponent`「修」这个问题**：`queryOf` 已经做了唯一
+   正确的一次解码，再解一次会让 slug 反向错配，直接破坏 §V5.2 的
+   「逐字匹配、不做归一化」安全前提。**危害等级不是"删不掉"而是"删错人设"**：
+   若注册表里同时存在 `50%25测试` 与 `50%测试`，加了 decode 之后删前者会**静默删掉后者**。
+   纯中文 slug 二次解码后值不变，所以中文用例对这个错误免疫——守它必须用带 `%` 的 slug。
+   客户端走 body（JSON UTF-8，中文实测无问题），不受影响。
+   三种响应可精确区分现场，按它排障：
+
+   | 响应 | 含义 |
+   |---|---|
+   | `400` + **空 body** | 裸非 ASCII 请求行，parser 拒绝，未进 handler |
+   | `400` + `BAD_INPUT` | 进了 handler，但 slug 没取到（空值 / shell 变量为空） |
+   | `404` + `NOT_FOUND` | 解码成功，逐字查表未命中 |
+3. **不加 `pluginEnabled()` 拦截**。v3 铁律「关闭态 `personas` 一律不拦」（§V3.5）在这里
+   格外重要：拦了就等于关掉插件后永远删不掉人设。
+4. `webServer.register` 是 `kind:'exact'` + handler 内分派 method，**不需要新注册路由**；
+   只需把末尾的 405 兜底保持为「其余 method 才 405」。信任栅栏与 method 无关，不改。
+5. `DELETE` 走 `readJsonBody`（空 body 返回 `{}`，所以纯 query 形态也可用）。
+
+## V5.5 客户端（`lib/client.js`、`locale/*.json`）
+
+顶部工具栏人设组三态**互斥**，且与「+ 添加人设」的内联表单互斥：
+
+```
+idle   : 人设 [下拉 ▾] [✎] [🗑]  [+ 添加人设]
+rename : 人设 [下拉 ▾] [输入框(预填当前显示名)] [保存] [取消]
+delete : 人设 [下拉 ▾] 确定删除「灰灰」及其人格、画像与全局记忆？此操作不可撤销。 [删除] [取消]
+```
+
+- 状态两位：`personaAction: 'idle'|'rename'|'delete'`、`renameValue: string`。
+  `selectPersona` / `createPersona` / 任一新表单打开时，其余表单一律复位 `idle`。
+- **重命名不发文档重载**：人设名不参与任何路径计算，PATCH 成功后只需刷新 bootstrap
+  拿新显示名。
+- **删除成功必须**：刷 bootstrap → 把本地 `persona` 置为响应 `current.slug` → 清 `drafts`
+  与 `docs`（让 `loadDocs` effect 重跑）→ 提示 `panel.personaDeleted`。
+- 🗑 禁用条件：选中 slug 是默认人设（**大小写不敏感**，见 §V5.2 的大小写铁律；`title` 给
+  原因）或 `busy`；✎ 仅 `busy` / 无人设时禁用。`lib/client.js` 不能 import store，所以
+  这里与 `lib/core/store.js` 的 `isDefaultSlug` 是**刻意的重复实现，两边必须同口径**，
+  改一边就要改另一边。只测小写 `default` 的用例挡不住这个缺陷。
+- 新增两个内联 svg 组件 `PencilIcon` / `TrashIcon`（照 `MemoryIcon` 风格，size 14，
+  `aria-hidden:"true"`，按钮另给 `aria-label`）。
+- 新增 CSS 两条，只用 §9 白名单 token：`.sm-icon-btn`（紧凑内边距、与下拉同高）、
+  `.sm-btn-danger`（`--dsw-alias-state-error-primary` 的描边与文字）。
+- 禁止 `window.confirm` / `window.prompt`（v2 起既定约束），确认与输入一律自绘。
+
+## V5.6 locale 新键（4 处逐键同步）
+
+`lib/client.js` 的 `en` 与 `zh` 两个内嵌词典 + `locale/en.json` + `locale/zh.json`，
+新增 8 键，**四处键集合必须完全相等**（§8 的既有要求，本次首次由测试守护）：
+
+| key | zh |
+|---|---|
+| `panel.personaRename` | 重命名 |
+| `panel.personaRenamed` | 已重命名人设。 |
+| `panel.personaRenameFailed` | 重命名人设失败：{error} |
+| `panel.personaDelete` | 删除人设 |
+| `panel.personaDeleteConfirm` | 确定删除「{name}」及其人格、画像与全局记忆？此操作不可撤销。 |
+| `panel.personaDeleted` | 已删除人设及其记忆文件。 |
+| `panel.personaDeleteFailed` | 删除人设失败：{error} |
+| `panel.personaDeleteLocked` | Default 人设不能删除。 |
+
+复用既有键：`panel.save`、`panel.personaCancel`。
+
+## V5.7 测试归属
+
+- `test/store.test.js`：重命名只改 `name`（slug / `docPath` / 已写文档内容不变，`personas.json`
+  落盘正确）；未知 slug → `NOT_FOUND`；空 / 非字符串 name → `BAD_INPUT`
+  （**超长 name 不在 store 报错**——§V5.2 细则 1 规定按码点截断到 60，与 `createPersona`
+  同口径；对 `> 60` 报 400 是 `handlePersonas` 自己的校验，见 §V5.4）；`deletePersona('default')`
+  → `PERSONA_PROTECTED` 且目录仍在；删非 current → current 不变；删 current → current 迁到
+  `default`；**注册表里没有 `default` 条目时删掉最后一个 → `current: null`**（对应 §V5.0 的
+  边界，钉死"不许删时报错、也不许凭空造条目"）；删后 `listPersonas` 无它且 `stat(dir)` 抛
+  `ENOENT`（含 `history/` 一并消失）；**删人设后 `readDocSync` 立即返回空模板**
+  （这条才是"漏清缓存"的回归网，理由见 §V5.2 第 5 步；`readDoc` 那条可以照写但抓不到 bug）。
+- `test/routes.test.js`：PATCH 200 且回带 `personas + current`；PATCH 空 name → 400、未知
+  slug → 404；DELETE 200 且列表少一个；DELETE 缺 slug → 400；DELETE `default` → 409
+  `PERSONA_PROTECTED`；未知 slug → 404；`enabled:false` 下 PATCH/DELETE 仍可（守 v3 铁律）。
+  **v5 有意改动的一条既有断言**：原 `it('DELETE 方法返回 405')` 与 §V5.4 直接冲突
+  （DELETE 从此是合法 method，缺 slug 时返回 400），405 兜底改由 `OPTIONS` 触发。
+  这是设计意图，不是误删断言，将来别把它改回去。
+
+  **`describe('真实回环 HTTP')` 下的 v5 新增用例**（不新增文件，走真实 `node:http` +
+  独立 `mkdtemp` store；ASCII slug 那条 mock 用例保留，它守的是另一件事）：
+  ① 中文 slug 经百分号编码的 query 形态 DELETE → 200 且 `stat(dir)` 抛 `ENOENT`；
+  ② 裸 UTF-8 中文请求行 → `400` + **空 body** + handler 未被调用；
+  ③ 含 `%` 的 slug（`50%25测试`）删除后它自己 ENOENT、`50%测试` 目录仍在、列表少的是前者
+  ——这条是 §V5.4 decode 禁令唯一的守网。
+  **测裸非 ASCII 请求行只能用 `node:net` 手写**：`fetch` 与 `http.request` 都会先把
+  非 ASCII 百分号编码掉（实测发裸中文，到 handler 时已是 `%E4%B8%B4...`），根本发不出
+  裸字节；curl 是外部二进制，不能进测试。响应按 latin1 取原文，避免解码掩盖
+  「parser 压根没生成响应」。
+  跨层失败特征区分：报「目录必须 ENOENT」= store 层问题；报状态码或响应形状 = 路由层问题。
+- `test/client-persona-crud.test.js`（新建）：照 `test/client-toggle.test.js` 的
+  「最小 react + 假 fetch 直接驱动 `lib/client.js`」模式，自带 mock，**不改已有测试文件**。
+  覆盖：✎ 进入重命名态并预填当前名；保存发 PATCH 且 body 正确、成功后提示与下拉显示名更新；
+  🗑 进入确认态、取消不发请求；确认后发 DELETE（body 带 slug）、成功后下拉切到响应
+  `current.slug`；选中 `default` 时 🗑 `disabled`；`busy` 时按钮全 `disabled`。
+  **外加词典一致性断言**：`client.js` 内嵌 `en` / `zh` 与 `locale/en.json`、`locale/zh.json`
+  键集合完全相等。
+- 验收：`node --test` 全绿（**不要 `node --test test/`**，本机 Node 24 会按模块解析它）；
+  用例数不少于 v4 基线 521。
+
+## V5.8 排查过程中确认存在的既有缺陷（v5 未修，如实登记）
+
+这三条都不是 v5 引入的。**当前状态**：第 1 条已由 v6 的目录归一化（§V6.1）在真实环境消除；
+第 2 条已由 v6 的补建条件（§V6.2）消除；第 3 条经 v6 复核裁定为按设计如此（§V6.3）。
+下面保留三条的成因描述，供排查历史数据时回看，不要再当成待修项。
+
+1. **同一个 Store 里存在两个「默认人设目录」。** `personaKey()` 的兜底值、`personaSlug()`
+   的兜底值、`resolveScope` 的兜底 `persona`、`resolveTargets` 的兜底值全是**小写
+   `default`**，指向 `personas/default/`；而注册表里的默认人设是 `index.js` 用
+   `createPersona('Default')` 建的 `personas/Default/`。Linux 文件系统大小写敏感，
+   **这是两个不同目录**。任何走兜底的读写（`resolveScope` 拿不到 session、整理器 scope
+   缺失、参数未显式传 persona）写进 `default/`，而面板与注入读 `Default/` ⇒ 同一份记忆
+   裂成两半，用户在面板上看不到工具或命令刚写进去的内容。这台机器上 `personas/` 下是
+   `default` 与 `工作`（v6 归一化已在真实环境验证）；成因保留在此，供排查仍带大写变体的
+   历史数据时对照。
+2. **`reconcileRegistry` 在 legacy 迁移分支写 `current = 'default'` 会造成悬空 current。**
+   触发条件：迁移已触发但一个可迁移人设都没有。此时 `currentPersona()` 靠悬空兜底返回
+   `{slug:'default'}`，而 `listPersonas()` 里没有这一项 ⇒ 面板下拉选中项对不上任何一行；
+   而 `index.js` 补建默认人设的条件是 `listPersonas().length === 0`，此时列表非空 ⇒
+   不会补建 ⇒ current 永久悬空，注入一直回退空模板，用户表现为「迁移完记忆全空」。
+3. **`setCurrentPersona` 的 NOT_FOUND 豁免只给小写 `default`。** 语义存在歧义：若本意是
+   「默认人设允许还没有目录」，该用大小写不敏感判定；若本意是「`personaKey` 的小写兜底键
+   特殊」，则现状正确。风险场景：`personas/Default/` 目录因故缺失时，面板切不回 Default，
+   而 `index.js` 因列表非空不会重建，只能人工建目录。
+
+另外两条与本节无关但同源的事实：`createPersona` / `setCurrentPersona` 在注册表写盘失败时
+内存已经脏（原地改 registry 再落盘，失败不回滚）；`reconcileRegistry` 只在 ready 时跑一次，
+所以 `rm` 后若目录被并发 `mkdir` 重建，会等到下次启动才被重新登记成条目。
+
+---
+
+# v6 变更：默认人设的 slug 统一为小写 `default`
+
+主人对 §V5.8 第 1 条的裁决是「根治：都改成小写，默认也是小写」。本章是落地契约。
+**它消除 §V5.8 的第 1、2、3 条**，落地后请把那一节据实改写，不要留着已修的事实继续挂账。
+
+## V6.0 决策与一处必要的修正
+
+| 项 | 决定 | 理由 |
+|---|---|---|
+| 默认人设 slug | 统一为**小写 `default`** | 与 `personaKey` / `personaSlug` / `resolveScope` / `resolveTargets` 的兜底键同名，裂口从根上消失 |
+| 默认人设显示名 | 仍为 **`Default`** | 用户在面板上看到的字不变，零感知 |
+| 存量大小写变体 | ready 时**自动归一**成小写目录 | 老环境（含主人这台）留有大写 `Default`，不归一就会同时出现两个默认人设 |
+| 禁删判断 | **保持大小写不敏感 `isDefaultSlug`，不得退回逐字比小写** | 见下 |
+
+> **为什么判断不能退回逐字比小写**：归一化之后新数据确实全是小写，但归一发生在 ready，
+> 而存量数据在被归一之前是真实存在的大写 `Default`。判断退回逐字比小写，等于在归一完成前
+> （以及任何归一被跳过 / 失败的环境里）默认人设重新变成可删除——正是 v5 那次真实误删的
+> 成因。判断比目录宽松没有代价：目录只有小写一个，判断覆盖所有大小写写法。
+
+## V6.1 归一化算法（`reconcileRegistry` 内，**在扫盘合并条目之前**）
+
+1. 判定集合：`scanPersonaDirs()` 里满足 `isDefaultSlug(dir.slug)` 的目录。
+2. 无需处理：只有 `slug === 'default'` 一个，或者一个都没有。
+3. **冲突则放弃**：以下任一条成立 ⇒ 什么都不动，只 `warn`（warn 文本要把找到的所有相关
+   slug 都列出来，含「注册表条目」标注，便于排障）。两个目录都可能有真实内容，自动合并
+   等于赌哪个该留；这种情况交给人工。
+   - 磁盘上小写 `default` 与任一大小写变体同时存在；
+   - 磁盘上只有变体，但**注册表里已有小写 `default` 条目**（把变体条目改名过去会造出
+     重复 slug，同样是二义）；
+   - **同时存在两个以上变体**（例如 `Default` 与 `DEFAULT` 并存）。
+4. 归一：变体目录改名为 `default`，复用现成的 `moveDir(from, to)`（已处理 `EXDEV`）。
+   **改名必须走两步**（`Default` → `.default-migrating-<随机>` → `default`）：macOS APFS 默认
+   大小写不敏感，直接 `rename('Default','default')` 在某些卷上会被判等而无效或直接报错。
+   任一步失败 ⇒ 放弃并 `warn`，**绝不 `rm`**，宁可留着裂口也不能弄丢目录。
+   第二跳失败要把临时名 `rename` 回原名——回滚是必要的：临时目录留在原地会被扫盘登记成
+   一个凭空多出的人设。
+4b. **改完必须复查磁盘实际目录名**（macOS 兜底）：APFS 默认大小写不敏感，
+   `rename` 只差大小写时可能被判定为同名而**静默无效且不报错**。若此时注册表条目已改成
+   `default`，下次 `scanPersonaDirs()` 扫到的 `Default` 会被当作一个新人设再登记一次
+   ⇒ 面板下拉凭空多出一条重复。所以改名后要 readdir 复查 `personasRoot` 里是否存在
+   **恰好等于** `default` 的名字；不存在 ⇒ 回滚注册表条目并 `warn`，**绝不留下
+   「条目与目录不一致」的半截状态**。为这条允许给归一函数加一个可选的复查注入点
+   （测试用它模拟「rename 声称成功但目录名仍是大写」），注释须写明它是为可测性开的，
+   不是业务参数。
+4c. `scanPersonaDirs()` **跳过前缀恰好为 `.default-migrating-` 的目录**（防止两跳都失败
+   且回滚也失败时留下幽灵人设）。**豁免范围就是这一个前缀**：不许扩大成「跳过所有点号
+   开头的目录」——`personaSlug('../../etc')` 产出的 `..-..-etc` 以点开头却是合法 slug，
+   且有存量用例专门守它，扩大豁免会让这类人设从面板凭空消失。
+5. 同步注册表：条目 `slug` 由变体改为 `default`（`name` / `createdAt` 原样保留，显示名因此
+   不变）；`current` 若等于旧变体也改为 `default`。目录改名后**不要**再依赖扫盘重新登记
+   出新条目——归一必须在扫盘合并之前完成，否则会先塞进一个大写条目再改名，留下重复。
+   **还要把 `options.defaultCurrent` 一起映射**：legacy 迁移传进来的首选 slug 若正是刚被
+   归一掉的变体，不映射就会 miss，`current` 随之漂到 `sortPersonas()[0]` 那个别的人设上。
+   因此归一函数要把被归一的旧 slug 回传给调用方做映射。
+6. 全程在 `ready` 的串行队列里，失败只 `warn` 不抛（铁律：宿主服务异常必须静默降级）。
+
+## V6.2 默认人设初始化条件变更（`lib/index.js`）
+
+现状是 `listPersonas().length === 0` 才建，改为**「列表里没有 `isDefaultSlug` 的条目就建」**，
+并用 `createPersona('default')` + `renamePersona('default', 'Default')` 两步得到
+「slug 小写、显示名 `Default`」。这一条同时消除 §V5.8 第 2 条的悬空 current：
+legacy 迁移后列表非空但没有默认人设时，现在也会补建，不再让 current 指向一个不存在的 slug。
+第二步 `renamePersona` 失败只 `warn`，不回滚——slug 已经对了，显示名是次要的。
+
+> **补建时绝对不许动 current（v6 最要紧的一条）**
+> 既有代码的形状是 `createPersona` 完紧接着 `setCurrentPersona`。照抄进补建路径的后果：
+> 存量用户打开面板发现自己的当前人设从 `工作` 变成了 `default` —— 那个人正在用原人格干活，
+> 后台换掉等于人格被劫持，且没有任何提示。规则：**只有 `current` 为空，或 `current` 指向
+> 注册表里不存在的 slug 时，才设成 default**；否则补建完就结束，current 一个字节都不碰。
+> 归一化路径同理：`current` 只有在等于被归一的旧变体时才改写，指向别人设时不动。
+
+**可测性**：初始化逻辑从 `void (async () => {...})()` 抽出为导出的
+`ensureDefaultPersona(store, logger)`，`apply` 内部继续 `void ensureDefaultPersona(...)`，
+行为不变。理由是 fire-and-forget 让「不发生」类断言只能靠轮询 + 静置固定窗口，慢且脆。
+**不要**改用「`apply` 返回句柄 / 挂 `ctx.supermemory`」的做法：cordis 如何对待 `apply`
+的返回值没有证据，为测试改插件入口的返回约定不划算，且有让宿主 await 住插件加载的风险。
+
+## V6.3 明确不动的东西
+
+- **默认人设判定共有三份逐字实现，不许漂移，也不许当成重复代码删掉**：
+  `lib/core/store.js` 的 `isDefaultSlug`、`lib/client.js` 的 `isDefaultSlug`、
+  `lib/index.js` 的 `isDefaultPersonaSlug`。三者必须逐字一致且大小写不敏感；注释要互相
+  指认另外两份所在文件。理由：`lib/client.js` 天生不能 import store，而 `lib/index.js`
+  为一份判定扩 store 的导出面不值得，宁可三份逐字实现并用注释钉住。
+  **只读契约就以为只有一份、顺手删掉"多余"的那份，是要防的事故。**
+- `lib/client.js` 里三处 `persona || 'default'` 空值兜底**不用改**——统一小写之后它们正好
+  与真实 slug 相等，这就是本次根治的红利。
+- 目录内的 `persona.json` meta 只有 `name` / `createdAt`，不含 slug，归一化不需要改写它。
+- `reconcileRegistry` 里 `defaultCurrent` 的逐字比较保持现状（入参与 `item.slug` 同源于磁盘
+  目录名，见 §V5.8）。
+- **`setCurrentPersona` 的 NOT_FOUND 豁免只给小写 `default`，v6 裁定为「按设计如此」，
+  不许顺手放宽**（§V5.8 第 3 条到此关闭）。归一之后条目 slug 恒为小写、`personaKey` 兜底
+  目录也是小写，豁免给小写正好对齐。放宽到大小写不敏感有害：入参 `key` 是
+  `personaSlug(slug.trim())` 算出来的，大写法会**静默放行一个既无目录也无注册表条目的
+  slug 成为 current**（store 层不做条目存在性校验），等于把刚消掉的悬空 current 又请回来。
+  残留风险只有「有人手工传 `Default` 得到 NOT_FOUND」，而面板传的一直是 slug（小写）。
+  真要放宽，必须连「current 必须命中注册表条目」一起加，那是独立决策。
+
+## V6.4 测试归属
+
+- **store-impl**（`lib/core/store.js` + `lib/index.js` + `test/store.test.js`）：
+  ① 变体目录 + 变体条目 + current 指向变体 → ready 之后目录是小写、条目 slug 是小写、
+  `name` 仍是 `Default`、current 是小写；② 小写与变体并存 → 两个目录都还在、只 warn、
+  注册表不变；③ 只有小写 → 不发生任何 rename（用 rename 计数或 spy 断言零次）；
+  ④ 改名失败（把 `rename` 打成抛错）→ 目录不丢、不 `rm`、不抛、只 warn；
+  ⑤ 归一后 `deletePersona('Default')` 仍 409（跨版本守网：判断宽松 + 目录小写时禁删照样生效）；
+  ⑥ 归一发生在扫盘合并之前（断言归一后注册表里没有大写字母开头的重复条目）；
+  ⑥b **current 不变**：`current==='工作'` 时，归一与补建两条路径跑完 current 仍是 `工作`
+  （§V6.2 的 current 铁律，主人这台机器就是该形态）。
+- **client-impl**（新建 `test/index-init.test.js`；**全仓此前没有任何测试 import 过
+  `lib/index.js`**，入口层由这几条补上。不跨测试文件 import，自带精简 makeCtx——
+  `logger.warn`→warnings[]、`get`、`on`、`effect` 十余行即可，宿主服务全返回 `undefined`
+  就够：入口只注册三个事件监听，测试不触发事件就永远碰不到它们）：
+  ⑦ 空环境 → `slug==='default'` **且** `name==='Default'` 同时断言，只断言 slug 会放过
+  「用户看到的名字变了」；⑧ 列表非空（真造一个 `工作`）但没有默认人设 → 补建发生
+  **且 `current` 仍是 `工作`**（同时守 §V5.8 第 2 条与 §V6.2 的 current 铁律）；
+  ⑨ 已有默认人设 → 不重复建，拆两个子场景：小写 `default` 已在 / 只有大写 `Default`
+  已在（后者从入口角度守「判断比目录宽松没有代价」，与 store 内部的归一是两个角度）；
+  ⑩ 真跑一次 `apply(ctx,{})` → 不抛、零 `warn`、空环境最终出现默认人设条目（允许轮询，
+  超时 3s；它守装配链路本身，与 await `ensureDefaultPersona` 的精确断言互补）。
+  夹具两条硬要求：**必须设 `process.env.DSH_HOME`**（`store.js` 的 `stateDir` 由它派生，
+  只传 `config.personasRoot` 挡不住，漏设就会写真实的 `~/.dsh`；恢复时 previous 为
+  `undefined` 要 `delete`）；预置数据走完 `store.dispose()` 之后才 `apply`
+  （入口在 store 构造期同步读注册表，顺序反了读不到）。
+- **夹具必须反映当前版本的真实形态**（v5 用一次真实误删换来的守则）：mock 里默认人设
+  长什么样，就要跟当前版本真实会建出来的一模一样。v5 是 `{slug:'Default'}`，v6 落地后是
+  `{slug:'default', name:'Default'}`——`test/client-persona-crud.test.js` 届时一并换回，
+  大写变体只保留在专门测大小写的那条用例里。
+- 全量 `node --test` 不得少于本章开工前的 566 条。
+
+## V6.5 存量环境的实际效果（主人这台机器）
+
+人设目录 `Default/` 会在下次启动时改名为 `default/`，注册表条目 `slug` 跟着变小写、
+`name` 保持 `Default`，面板下拉里那一行**看起来完全没变**；当前人设是 `工作`，不受影响。
+`工作` 等非默认人设一律不碰。

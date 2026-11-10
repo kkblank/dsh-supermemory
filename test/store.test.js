@@ -573,6 +573,632 @@ describe('人设注册表（v2）', () => {
     await store.ensurePreset('my:preset')
     assert.equal(store.listPersonas().length, 1)
   })
+
+  // ———— v5：重命名与删除（契约 §V5.7，细则见 §V5.2）————
+
+  describe('重命名与删除（v5）', () => {
+    test('renamePersona 只改显示名：slug / 目录 / 文档内容与 mtime 一概不动，personas.json 落盘正确', async () => {
+      const created = await store.createPersona('灰灰')
+      const ref = { kind: 'soul', persona: '灰灰' }
+      await store.setCurrentPersona('灰灰')
+      const content = '# 人格 (soul)\n\n- 原样保留\n'
+      assert.equal((await store.writeDoc(ref, content)).ok, true)
+      const docFile = store.docPath(ref)
+      const mtimeBefore = (await stat(docFile)).mtimeMs
+
+      const renamed = await store.renamePersona('灰灰', '  阿灰  ')
+      assert.equal(renamed.ok, true)
+      assert.deepEqual(renamed.persona, {
+        slug: '灰灰',
+        name: '阿灰',
+        createdAt: created.persona.createdAt,
+        dir: join(personasRoot, '灰灰'),
+      })
+
+      // 目录与文档没动，路径也没变（重命名不参与任何路径计算）。
+      assert.equal(store.docPath(ref), docFile)
+      assert.equal((await stat(docFile)).mtimeMs, mtimeBefore)
+      assert.equal((await store.readDoc(ref)).content, content)
+      assert.equal(store.listPersonas()[0].name, '阿灰')
+
+      // 落盘：只改 name，slug / createdAt / current 原样。
+      const registry = await readRegistry()
+      assert.deepEqual(registry.personas, [{ slug: '灰灰', name: '阿灰', createdAt: created.persona.createdAt }])
+      assert.equal(registry.current, '灰灰')
+      assert.deepEqual(store.currentPersona(), { slug: '灰灰', name: '阿灰' })
+
+      // 细则 4：不写 persona.json——多写一个文件只会多一个失败面。
+      await assert.rejects(stat(join(personasRoot, '灰灰/persona.json')), (error) => error.code === 'ENOENT')
+
+      const fresh = makeStore()
+      await fresh.ready
+      assert.deepEqual(fresh.currentPersona(), { slug: '灰灰', name: '阿灰' })
+      await fresh.dispose()
+    })
+
+    test('renamePersona 未知 slug → NOT_FOUND；空 / 非字符串 name → BAD_INPUT；超长按码点截 60', async () => {
+      const created = await store.createPersona('Work')
+
+      const missing = await store.renamePersona('nope', 'X')
+      assert.equal(missing.ok, false)
+      assert.equal(missing.code, 'NOT_FOUND')
+      assert.deepEqual(store.listPersonas().map((item) => item.slug), ['Work'])
+
+      for (const bad of ['', '   ', null, undefined, 42]) {
+        const result = await store.renamePersona('Work', bad)
+        assert.equal(result.ok, false)
+        assert.equal(result.code, 'BAD_INPUT')
+      }
+      for (const bad of ['', null, 42]) {
+        const result = await store.renamePersona(bad, 'X')
+        assert.equal(result.ok, false)
+        assert.equal(result.code, 'BAD_INPUT')
+      }
+      // 非法入参不能把既有名字改坏。
+      assert.equal(store.listPersonas()[0].name, 'Work')
+
+      const long = await store.renamePersona('Work', `  ${'字'.repeat(80)}  `)
+      assert.equal(long.ok, true)
+      assert.equal(long.persona.name, '字'.repeat(60))
+      assert.equal([...long.persona.name].length, 60)
+      assert.equal(created.persona.slug, 'Work')
+      assert.equal(store.listPersonas()[0].slug, 'Work')
+    })
+
+    test('deletePersona("Default") → PERSONA_PROTECTED，检查在任何 IO 之前（连注册表都不碰）', async () => {
+      // 真实环境里默认人设的 slug 是 **大写 D**：lib/index.js 用 createPersona('Default')，
+      // 而 personaSlug 原样保留大小写。用小写 'default' 测保护，全绿也挡不住真实事故。
+      // 这里只用 writeDoc 落出 personas/Default/ 目录（不登记、不写注册表），
+      // 好让下面那条「注册表文件仍未被创建」的断言成立——禁删发生在查表之前。
+      const ref = { kind: 'soul', persona: 'Default' }
+      assert.equal((await store.writeDoc(ref, '# 人格 (soul)\n\n- 别删我\n')).ok, true)
+      assert.deepEqual(store.listPersonas(), [])
+
+      const result = await store.deletePersona('Default')
+      assert.equal(result.ok, false)
+      assert.equal(result.code, 'PERSONA_PROTECTED')
+
+      // 目录与内容完好。
+      assert.equal((await stat(join(personasRoot, 'Default'))).isDirectory(), true)
+      assert.equal((await stat(join(personasRoot, 'Default/soul.md'))).isFile(), true)
+      // 没有任何 IO 副作用：注册表文件根本没被创建。
+      await assert.rejects(stat(join(dshHome, 'supermemory/personas.json')), (error) => error.code === 'ENOENT')
+    })
+
+    test('deletePersona 三种大小写写法全都禁删：Default / default / DEFAULT', async () => {
+      // 文件系统大小写敏感，三种写法是两个不同的目录名；但语义上都是「默认人设」，一律不许删。
+      const created = await store.createPersona('Default')
+      assert.equal(created.persona.slug, 'Default')
+      await store.setCurrentPersona('Default')
+      // 顺带造一个小写同名目录：证明禁删不是靠「该目录不存在」蒙对的
+      // （退回逐字比较后，'default' 会走查表返回 NOT_FOUND，同样过不了这条）。
+      await mkdir(join(personasRoot, 'default'), { recursive: true })
+      assert.equal((await store.writeDoc({ kind: 'soul', persona: 'Default' }, '# 人格 (soul)\n\n- 默认人格\n')).ok, true)
+
+      for (const slug of ['Default', 'default', 'DEFAULT', 'DeFaUlT']) {
+        const result = await store.deletePersona(slug)
+        assert.equal(result.ok, false, slug)
+        assert.equal(result.code, 'PERSONA_PROTECTED', slug)
+      }
+
+      // 两个目录都还在，注册表条目与 current 也没被动过。
+      assert.equal((await stat(join(personasRoot, 'Default'))).isDirectory(), true)
+      assert.equal((await stat(join(personasRoot, 'Default/soul.md'))).isFile(), true)
+      assert.equal((await stat(join(personasRoot, 'default'))).isDirectory(), true)
+      assert.deepEqual(store.listPersonas().map((item) => item.slug), ['Default'])
+      assert.deepEqual(store.currentPersona(), { slug: 'Default', name: 'Default' })
+    })
+
+    test('deletePersona 删掉非 current：current 与其余人设不受影响', async () => {
+      const alpha = await store.createPersona('Alpha')
+      await store.createPersona('Beta')
+      await store.setCurrentPersona(alpha.persona.slug)
+
+      const result = await store.deletePersona('Beta')
+      assert.equal(result.ok, true)
+      assert.deepEqual(result.deleted, { slug: 'Beta', name: 'Beta' })
+      assert.deepEqual(result.current, { slug: 'Alpha', name: 'Alpha' })
+      assert.deepEqual(store.currentPersona(), { slug: 'Alpha', name: 'Alpha' })
+      assert.deepEqual(store.listPersonas().map((item) => item.slug), ['Alpha'])
+
+      const registry = await readRegistry()
+      assert.equal(registry.current, 'Alpha')
+      assert.deepEqual(registry.personas.map((item) => item.slug), ['Alpha'])
+      assert.equal((await stat(join(personasRoot, 'Alpha'))).isDirectory(), true)
+    })
+
+    test('deletePersona 删掉 current：迁到 default；无 default 时迁到 createdAt 最早的', async () => {
+      await store.createPersona('Work')
+      await store.setCurrentPersona('default') // 登记 default（目录可以还不存在）
+      await store.setCurrentPersona('Work')
+      assert.deepEqual(store.currentPersona(), { slug: 'Work', name: 'Work' })
+
+      const deleted = await store.deletePersona('Work')
+      assert.equal(deleted.ok, true)
+      assert.deepEqual(deleted.current, { slug: 'default', name: 'default' })
+      assert.deepEqual(store.currentPersona(), { slug: 'default', name: 'default' })
+      assert.equal((await readRegistry()).current, 'default')
+    })
+
+    test('deletePersona 删掉 current 且没有 default：迁到剩余里 createdAt 最早的一个', async () => {
+      await store.createPersona('Alpha')
+      await store.createPersona('Beta')
+      const registryPath = join(dshHome, 'supermemory/personas.json')
+      const raw = JSON.parse(await readFile(registryPath, 'utf8'))
+      raw.current = 'Alpha'
+      raw.personas.find((item) => item.slug === 'Alpha').createdAt = '2026-11-10T05:00:00.000Z'
+      raw.personas.find((item) => item.slug === 'Beta').createdAt = '2026-11-10T01:00:00.000Z'
+      await writeFile(registryPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8')
+
+      const fresh = makeStore()
+      await fresh.ready
+      assert.deepEqual(fresh.currentPersona(), { slug: 'Alpha', name: 'Alpha' })
+
+      const deleted = await fresh.deletePersona('Alpha')
+      assert.equal(deleted.ok, true)
+      assert.deepEqual(deleted.current, { slug: 'Beta', name: 'Beta' })
+      assert.deepEqual(fresh.currentPersona(), { slug: 'Beta', name: 'Beta' })
+      assert.equal((await readRegistry()).current, 'Beta')
+      await fresh.dispose()
+    })
+
+    test('deletePersona 删掉 current：接班优先大写的 Default，而不是 createdAt 最早的那个', async () => {
+      // 真实环境剩余列表里躺着的是 'Default'（大写），逐字比小写会跳过它、
+      // 落进「createdAt 最早」分支——所以这里故意让 Default 是剩余里最晚创建的。
+      //
+      // 场景刻意**不给 Default 建目录**：v6 的归一化只管磁盘上真实存在的变体目录，
+      // 悬空的大写条目它碰不到。这正是 §V6.0 说的「归一完成前 / 归一被跳过的环境」，
+      // 也是 isDefaultSlug 不得退回逐字比小写的理由——否则默认人设在这些环境里又能被删。
+      const registryPath = join(dshHome, 'supermemory/personas.json')
+      await mkdir(join(dshHome, 'supermemory'), { recursive: true })
+      await writeFile(registryPath, `${JSON.stringify({
+        version: 1,
+        current: 'Work',
+        personas: [
+          { slug: 'Default', name: 'Default', createdAt: '2026-11-10T09:00:00.000Z' }, // 最晚
+          { slug: 'Work', name: 'Work', createdAt: '2026-11-10T01:00:00.000Z' },
+          { slug: 'Alpha', name: 'Alpha', createdAt: '2026-11-10T05:00:00.000Z' },
+        ],
+      }, null, 2)}\n`, 'utf8')
+      for (const slug of ['Work', 'Alpha']) await mkdir(join(personasRoot, slug), { recursive: true })
+
+      const fresh = makeStore()
+      await fresh.ready
+      // 前提：磁盘上没有变体目录 ⇒ 归一化没有触碰这个悬空条目。
+      assert.deepEqual(fresh.listPersonas().map((item) => item.slug), ['Work', 'Alpha', 'Default'])
+      assert.deepEqual(fresh.currentPersona(), { slug: 'Work', name: 'Work' })
+
+      const deleted = await fresh.deletePersona('Work')
+      assert.equal(deleted.ok, true)
+      assert.deepEqual(deleted.current, { slug: 'Default', name: 'Default' })
+      assert.deepEqual(fresh.currentPersona(), { slug: 'Default', name: 'Default' })
+      assert.equal((await readRegistry()).current, 'Default')
+      await fresh.dispose()
+    })
+
+    test('deletePersona 删掉最后一个（且非 default）：current 回退空串 → null', async () => {
+      const solo = await store.createPersona('Solo')
+      await store.setCurrentPersona(solo.persona.slug)
+
+      const result = await store.deletePersona(solo.persona.slug)
+      assert.equal(result.ok, true)
+      assert.deepEqual(result.deleted, { slug: 'Solo', name: 'Solo' })
+      assert.equal(result.current, null)
+      assert.equal(store.currentPersona(), null)
+      assert.equal((await readRegistry()).current, '')
+      assert.deepEqual(store.listPersonas(), [])
+    })
+
+    test('deletePersona 注册表里没有 default 条目时删掉最后一个：current null，不报错也不凭空造条目', async () => {
+      // 契约 §V5.0 的边界：真实运行下 index.js 启动会建 Default，但只把 personas/ 目录
+      // 拷到新机器、没带 personas.json 时，reconcileRegistry 只登记扫到的目录，
+      // 不会凭空补一条 default。此刻删掉最后一个就是「全空」，那是允许的收敛态。
+      const dir = join(personasRoot, 'Solo')
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, 'soul.md'), '# 人格 (soul)\n\n- 唯一的一份\n', 'utf8')
+
+      const fresh = makeStore()
+      await fresh.ready
+      // 前提：扫描登记出 Solo 并把它当 current，注册表里确实没有 default。
+      assert.deepEqual(fresh.listPersonas().map((item) => item.slug), ['Solo'])
+      assert.deepEqual(fresh.currentPersona(), { slug: 'Solo', name: 'Solo' })
+
+      const result = await fresh.deletePersona('Solo')
+      assert.equal(result.ok, true) // 禁止动作一：删除时报错
+      assert.deepEqual(result.deleted, { slug: 'Solo', name: 'Solo' })
+      assert.equal(result.current, null)
+      assert.equal(fresh.currentPersona(), null)
+      assert.deepEqual(fresh.listPersonas(), []) // 禁止动作二：凭空造条目
+
+      // 落盘形态同样是干净的全空，没有偷偷塞回 default。
+      assert.deepEqual(await readRegistry(), { version: 1, current: '', personas: [] })
+      await assert.rejects(stat(join(personasRoot, 'default')), (error) => error.code === 'ENOENT')
+
+      // 下一次启动也不该由 reconcileRegistry 补出条目（自愈属于 index.js 的初始化，不在存储层）。
+      const after = makeStore()
+      await after.ready
+      assert.deepEqual(after.listPersonas(), [])
+      assert.equal(after.currentPersona(), null)
+      await after.dispose()
+    })
+
+    test('deletePersona 连目录带 history/ 快照一并消失，重启也不会被重新登记', async () => {
+      await store.createPersona('Ghost')
+      const ref = { kind: 'soul', persona: 'Ghost' }
+      assert.equal((await store.writeDoc(ref, '# 人格 (soul)\n\n- 现内容\n')).ok, true)
+      const snap = await store.writeDocSnapshot(ref, '# 人格 (soul)\n\n- 旧内容\n')
+      assert.equal(snap.ok, true)
+      const dir = join(personasRoot, 'Ghost')
+      assert.equal((await stat(join(dir, 'history'))).isDirectory(), true)
+
+      assert.equal((await store.deletePersona('Ghost')).ok, true)
+      assert.deepEqual(store.listPersonas(), [])
+      await assert.rejects(stat(dir), (error) => error.code === 'ENOENT')
+
+      const fresh = makeStore()
+      await fresh.ready
+      assert.deepEqual(fresh.listPersonas(), [])
+      await fresh.dispose()
+    })
+
+    test('slug 逐字查表，绝不做 personaSlug 归一化：`../etc` 命中不了已登记的 `..-etc`', async () => {
+      // 磁盘上有个归一化后与 `../etc` 恰好同名的目录，而且它已被登记成人设：
+      // 一旦对入参做归一化，这个无辜人设就会被误删（§V5.2 的安全要点）。
+      await mkdir(join(personasRoot, '..-etc'), { recursive: true })
+      const fresh = makeStore()
+      await fresh.ready
+      assert.ok(fresh.listPersonas().some((item) => item.slug === '..-etc'))
+
+      for (const sneaky of ['../etc', '../../etc', '..-etc/../..-etc', 'nope']) {
+        const renamed = await fresh.renamePersona(sneaky, 'X')
+        assert.equal(renamed.ok, false, sneaky)
+        assert.equal(renamed.code, 'NOT_FOUND', sneaky)
+        const removed = await fresh.deletePersona(sneaky)
+        assert.equal(removed.ok, false, sneaky)
+        assert.equal(removed.code, 'NOT_FOUND', sneaky)
+      }
+      // 越界无从发生：那个无辜人设的目录与条目都还在。
+      assert.equal((await stat(join(personasRoot, '..-etc'))).isDirectory(), true)
+      assert.ok(fresh.listPersonas().some((item) => item.slug === '..-etc'))
+
+      // 只有逐字给出的 slug 才删得掉。
+      assert.equal((await fresh.deletePersona('..-etc')).ok, true)
+      assert.deepEqual(fresh.listPersonas(), [])
+      await fresh.dispose()
+
+      assert.equal((await store.deletePersona('')).code, 'BAD_INPUT')
+      assert.equal((await store.deletePersona(null)).code, 'BAD_INPUT')
+      assert.equal((await store.renamePersona('', 'X')).code, 'BAD_INPUT')
+    })
+
+    test('删人设会清掉进程内缓存：readDocSync 不再吐出没掉的内容', async () => {
+      await store.createPersona('Ghost')
+      const ref = { kind: 'soul', persona: 'Ghost' }
+      const content = '# 人格 (soul)\n\n- 已随人设删除\n'
+      assert.equal((await store.writeDoc(ref, content)).ok, true)
+      assert.equal(store.readDocSync(ref).content, content) // 先确认缓存里确实有
+
+      assert.equal((await store.deletePersona('Ghost')).ok, true)
+      const after = store.readDocSync(ref)
+      assert.notEqual(after.content, content)
+      assert.ok(after.content.startsWith('# 人格 (soul)'))
+      assert.equal(after.mtimeMs, 0)
+    })
+
+    test('删后重建同名 slug → readDoc 返回空模板（缓存不留残影，回归 §V5.2 第 5 步）', async () => {
+      await store.createPersona('Ghost')
+      const ref = { kind: 'soul', persona: 'Ghost' }
+      assert.equal((await store.writeDoc(ref, '# 人格 (soul)\n\n- 上一世的记忆\n')).ok, true)
+      assert.equal((await store.deletePersona('Ghost')).ok, true)
+
+      const again = await store.createPersona('Ghost')
+      assert.equal(again.ok, true)
+      assert.equal(again.persona.slug, 'Ghost') // 目录已删，slug 不该被追加 -2
+
+      const doc = await store.readDoc(ref)
+      assert.equal(doc.content.includes('上一世的记忆'), false)
+      assert.ok(doc.content.startsWith('# 人格 (soul)'))
+      assert.equal(doc.mtimeMs, 0)
+      assert.equal(store.readDocSync(ref).content.includes('上一世的记忆'), false)
+    })
+  })
+})
+
+describe('默认人设 slug 归一化（v6）', () => {
+  /** 判定独立于被测实现：测试要能在 store.js 的判断被改坏时照样报警。 */
+  const isDefaultLike = (slug) => typeof slug === 'string' && slug.toLowerCase() === 'default'
+
+  /** 造一个带 persona.json 与 soul.md 的人设目录（模拟存量环境的磁盘形态）。 */
+  async function seedDir(dir, meta, soul) {
+    await mkdir(dir, { recursive: true })
+    if (meta !== undefined) await writeFile(join(dir, 'persona.json'), `${JSON.stringify(meta)}\n`, 'utf8')
+    if (soul !== undefined) await writeFile(join(dir, 'soul.md'), soul, 'utf8')
+    return dir
+  }
+
+  const seedPersonaDir = (slug, meta, soul) => seedDir(join(personasRoot, slug), meta, soul)
+  const seedLegacyDir = (slug, meta, soul) => seedDir(join(legacyRoot, slug), meta, soul)
+
+  /** 直接写 personas.json（存量环境的注册表形态）。 */
+  async function writeRegistry(registry) {
+    await writeFile(join(dshHome, 'supermemory/personas.json'), `${JSON.stringify(registry, null, 2)}\n`, 'utf8')
+  }
+
+  test('① 存量 Default：ready 之后目录 / 条目 / current 全变小写，显示名仍是 Default', async () => {
+    const soul = '# 人格 (soul)\n\n- 存量内容\n'
+    await seedPersonaDir('Default', { name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }, soul)
+    await writeRegistry({
+      version: 1,
+      current: 'Default',
+      personas: [{ slug: 'Default', name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }],
+    })
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.equal((await stat(join(personasRoot, 'default/soul.md'))).isFile(), true)
+    assert.equal(await readFile(join(personasRoot, 'default/soul.md'), 'utf8'), soul)
+    await assert.rejects(stat(join(personasRoot, 'Default')), (error) => error.code === 'ENOENT')
+
+    const registry = await readRegistry()
+    assert.deepEqual(registry.personas, [{ slug: 'default', name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }])
+    assert.equal(registry.current, 'default')
+    assert.deepEqual(fresh.currentPersona(), { slug: 'default', name: 'Default' })
+    assert.deepEqual(fresh.listPersonas().map((item) => item.dir), [join(personasRoot, 'default')])
+    await fresh.dispose()
+  })
+
+  test('② 小写与变体并存：两个目录都还在、内容不动、注册表不变，只 warn', async () => {
+    const lower = '# 人格 (soul)\n\n- 小写侧\n'
+    const upper = '# 人格 (soul)\n\n- 大写侧\n'
+    await seedPersonaDir('default', { name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }, lower)
+    await seedPersonaDir('Default', { name: 'Default', createdAt: '2026-11-10T02:00:00.000Z' }, upper)
+    const snapshot = {
+      version: 1,
+      current: 'Default',
+      personas: [
+        { slug: 'Default', name: 'Default', createdAt: '2026-11-10T02:00:00.000Z' },
+        { slug: 'default', name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' },
+      ],
+    }
+    await writeRegistry(snapshot)
+
+    const fresh = makeStore()
+    await fresh.ready
+    // 两个目录都活着，内容一字未动（自动合并等于赌哪个该留，禁止）。
+    assert.equal(await readFile(join(personasRoot, 'default/soul.md'), 'utf8'), lower)
+    assert.equal(await readFile(join(personasRoot, 'Default/soul.md'), 'utf8'), upper)
+    assert.deepEqual((await readRegistry()).personas.map((item) => item.slug), ['Default', 'default'])
+    assert.deepEqual(await readRegistry(), snapshot)
+    assert.ok(warnings.some((line) => line.includes('default persona slug conflict')))
+    await fresh.dispose()
+  })
+
+  test('②b 多个大写变体同时存在：同样放弃并 warn，不挑一个改名（§V6.1 第 3 步的同一原则）', async () => {
+    await seedPersonaDir('Default', { name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' })
+    await seedPersonaDir('DEFAULT', { name: 'DEFAULT', createdAt: '2026-11-10T02:00:00.000Z' })
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.equal((await stat(join(personasRoot, 'Default'))).isDirectory(), true)
+    assert.equal((await stat(join(personasRoot, 'DEFAULT'))).isDirectory(), true)
+    assert.equal((await readdir(personasRoot)).some((name) => name.startsWith('.default-migrating-')), false)
+    assert.deepEqual((await readRegistry()).personas.map((item) => item.slug).sort(), ['DEFAULT', 'Default'])
+    assert.ok(warnings.some((line) => line.includes('default persona slug conflict')))
+    await fresh.dispose()
+  })
+
+  test('③ 只有小写 default 时不发生任何改名：personasRoot 的 mtime 一步未动', async () => {
+    // store 内部 import 的 rename 无法从测试侧 spy（ESM 绑定只读），所以用父目录 mtime 取证：
+    // 任何一次改名（哪怕是「Default→临时名→default」这种绕圈）都会改动 personasRoot 的 mtime。
+    await seedPersonaDir('default', { name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }, '# 人格 (soul)\n\n- x\n')
+    await seedPersonaDir('工作', { name: '工作', createdAt: '2026-11-10T02:00:00.000Z' }) // 有别的目录也不许动手
+    await writeRegistry({
+      version: 1,
+      current: 'default',
+      personas: [
+        { slug: 'default', name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' },
+        { slug: '工作', name: '工作', createdAt: '2026-11-10T02:00:00.000Z' },
+      ],
+    })
+
+    const before = await stat(personasRoot)
+    const fresh = makeStore()
+    await fresh.ready
+    const after = await stat(personasRoot)
+    assert.equal(after.mtimeMs, before.mtimeMs)
+    assert.equal(after.inode, before.inode)
+    assert.deepEqual(await readRegistry(), {
+      version: 1,
+      current: 'default',
+      personas: [
+        { slug: 'default', name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' },
+        { slug: '工作', name: '工作', createdAt: '2026-11-10T02:00:00.000Z' },
+      ],
+    })
+    assert.deepEqual(warnings, []) // 连「冲突」都不该误报
+    await fresh.dispose()
+  })
+
+  test('④ 改名失败（目标名被一个文件占着）：Default 原样回来、绝不 rm、不抛、只 warn', async () => {
+    const soul = '# 人格 (soul)\n\n- 绝不能丢\n'
+    await seedPersonaDir('Default', { name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }, soul)
+    // 用普通文件占住 default 这个名字：scanPersonaDirs 只收目录（不触发冲突豁免），
+    // 而 rename(临时名 → 该文件) 必然抛错 —— 正好真实演练「第二跳失败」。
+    await writeFile(join(personasRoot, 'default'), '我不是目录', 'utf8')
+    const snapshot = {
+      version: 1,
+      current: 'Default',
+      personas: [{ slug: 'Default', name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }],
+    }
+    await writeRegistry(snapshot)
+
+    const fresh = makeStore()
+    await fresh.ready // 归一失败只 warn，ready 永不 reject
+    assert.equal(await readFile(join(personasRoot, 'Default/soul.md'), 'utf8'), soul)
+    assert.equal((await stat(join(personasRoot, 'Default'))).isDirectory(), true)
+    // 第二跳失败后临时名必须被回滚掉：scanPersonaDirs 不跳过点号目录，留下它就是幽灵人设。
+    assert.equal((await readdir(personasRoot)).some((name) => name.startsWith('.default-migrating-')), false)
+    // 注册表停在归一前的形态，没有半截改完。
+    assert.deepEqual(await readRegistry(), snapshot)
+    assert.ok(warnings.some((line) => line.includes('second hop')))
+    assert.ok(warnings.length < 5) // 只告警，没有刷屏式重试
+    await fresh.dispose()
+  })
+
+  test('归一绝不碰 current：current 是「工作」时归一完还是「工作」（§V6.5 主人这台机器）', async () => {
+    // 存量用户正用「工作」这个人格干活。归一只是把 Default 目录与条目换成小写，
+    // current 一个字节都不许动；非默认人设一律不碰。
+    await seedPersonaDir('Default', { name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }, '# 人格 (soul)\n\n- 默认\n')
+    await seedPersonaDir('工作', { name: '工作', createdAt: '2026-11-10T02:00:00.000Z' }, '# 人格 (soul)\n\n- 工作人格\n')
+    await writeRegistry({
+      version: 1,
+      current: '工作',
+      personas: [
+        { slug: 'Default', name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' },
+        { slug: '工作', name: '工作', createdAt: '2026-11-10T02:00:00.000Z' },
+      ],
+    })
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.equal((await readRegistry()).current, '工作')
+    assert.deepEqual(fresh.currentPersona(), { slug: '工作', name: '工作' })
+    // current 不动与归一成功是两件事，两件都要成立：
+    assert.deepEqual(fresh.listPersonas().map((item) => item.slug), ['default', '工作'])
+    assert.equal((await stat(join(personasRoot, 'default'))).isDirectory(), true)
+    await assert.rejects(stat(join(personasRoot, 'Default')), (error) => error.code === 'ENOENT')
+    // 「工作」的目录与内容分毫未动。
+    assert.equal(await readFile(join(personasRoot, '工作/soul.md'), 'utf8'), '# 人格 (soul)\n\n- 工作人格\n')
+    assert.ok(!warnings.some((line) => line.includes('conflict')))
+    await fresh.dispose()
+  })
+
+  test('扫描豁免只认 .default-migrating- 前缀：临时目录不会变成幽灵人设', async () => {
+    // 归一崩溃可能把临时目录留在原地。它不是人设，不许被登记进面板。
+    await seedDir(join(personasRoot, '.default-migrating-a1b2c3d4'), { name: '看起来像人设', createdAt: '2026-11-10T01:00:00.000Z' })
+    await seedPersonaDir('工作', { name: '工作', createdAt: '2026-11-10T02:00:00.000Z' })
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.deepEqual(fresh.listPersonas().map((item) => item.slug), ['工作'])
+    assert.deepEqual((await readRegistry()).personas.map((item) => item.slug), ['工作'])
+    // 目录本身留在原地：豁免是「不登记」，不是「删掉」——归一恢复还要靠它。
+    assert.equal((await stat(join(personasRoot, '.default-migrating-a1b2c3d4'))).isDirectory(), true)
+    await fresh.dispose()
+  })
+
+  test('豁免不许扩大：..-..-etc 这种点开头的合法人设照旧登记', async () => {
+    // personaSlug('../../etc') 产出 '..-..-etc' —— 合法 slug 且以点开头。
+    // 谁把豁免改成「跳过所有点号开头的目录」，这条就红在谁脸上：那等于让真人设凭空消失。
+    await seedPersonaDir('..-..-etc', { name: '../../etc', createdAt: '2026-11-10T01:00:00.000Z' }, '# 人格 (soul)\n\n- 越界名字的人设\n')
+    await seedDir(join(personasRoot, '.default-migrating-x'), { name: '临时', createdAt: '2026-11-10T02:00:00.000Z' })
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.deepEqual(fresh.listPersonas().map((item) => item.slug), ['..-..-etc'])
+    assert.deepEqual((await readRegistry()).personas.map((item) => item.slug), ['..-..-etc'])
+    // 顺带确认它被当成正常人设对待：current 为空时被补位成它。
+    assert.deepEqual(fresh.currentPersona(), { slug: '..-..-etc', name: '../../etc' })
+    await fresh.dispose()
+  })
+
+  test('复查兜底：rename 不抛错但磁盘名仍是大写时，注册表条目绝不跟着改', async () => {
+    const soul = '# 人格 (soul)\n\n- 存量内容\n'
+    await seedPersonaDir('Default', { name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }, soul)
+    const snapshot = {
+      version: 1,
+      current: 'Default',
+      personas: [{ slug: 'Default', name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }],
+    }
+    await writeRegistry(snapshot)
+
+    const fresh = makeStore({
+      foldProbe: (names) => {
+        // 前提自证（Linux 上 rename 其实成功了）：兜底**不是**因为改名失败才触发的，
+        // 而是复查说「磁盘上没有恰好叫 default 的名字」。少了这两行，这条用例是假绿。
+        assert.ok(names.includes('default'), '前提：本机 rename 真的落到了小写名上')
+        return false // 模拟 macOS APFS：rename 被判等而静默无效，磁盘名仍是 Default
+      },
+    })
+    await fresh.ready
+    // 注册表一字未改 ⇒ 不会出现「条目写 default、磁盘还是 Default」，下次扫盘也就多不出一行重复。
+    assert.deepEqual(await readRegistry(), snapshot)
+    assert.deepEqual(fresh.listPersonas().map((item) => item.slug), ['Default'])
+    assert.ok(warnings.some((line) => line.includes("still not named 'default'")))
+    await fresh.dispose()
+  })
+
+  test('复查兜底的磁盘恢复：残留的临时目录被改回原变体名，内容一个不丢', async () => {
+    // 模拟上次归一崩在中途：磁盘上既有 Default（本轮要归一的），又有 .default-migrating-zzz。
+    // 复查判失败后，恢复逻辑必须把临时名 rename 回 Default —— 是改名，绝不 rm。
+    await seedPersonaDir('Default', { name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' })
+    await seedDir(join(personasRoot, '.default-migrating-zzz'), { name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }, '# 人格 (soul)\n\n- 崩溃前写下的内容\n')
+    await writeRegistry({
+      version: 1,
+      current: 'Default',
+      personas: [{ slug: 'Default', name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }],
+    })
+
+    const fresh = makeStore({ foldProbe: () => false })
+    await fresh.ready
+    assert.equal((await readdir(personasRoot)).some((name) => name.startsWith('.default-migrating-')), false)
+    assert.equal(
+      await readFile(join(personasRoot, 'Default/soul.md'), 'utf8'),
+      '# 人格 (soul)\n\n- 崩溃前写下的内容\n',
+    )
+    assert.deepEqual((await readRegistry()).personas.map((item) => item.slug), ['Default'])
+    await fresh.dispose()
+  })
+
+  test('⑤ 归一之后 deletePersona("Default") 仍然 PERSONA_PROTECTED（跨版本守网）', async () => {
+    await seedPersonaDir('Default', { name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }, '# 人格 (soul)\n\n- 默认人格\n')
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.deepEqual(fresh.listPersonas().map((item) => item.slug), ['default'])
+
+    for (const slug of ['Default', 'default', 'DEFAULT']) {
+      const result = await fresh.deletePersona(slug)
+      assert.equal(result.ok, false, slug)
+      assert.equal(result.code, 'PERSONA_PROTECTED', slug)
+    }
+    assert.equal((await stat(join(personasRoot, 'default'))).isDirectory(), true)
+    assert.equal((await stat(join(personasRoot, 'default/soul.md'))).isFile(), true)
+    assert.deepEqual(fresh.listPersonas().map((item) => item.slug), ['default'])
+    await fresh.dispose()
+  })
+
+  test('⑥ 归一排在扫盘合并之前：注册表不会同时出现 Default 与 default', async () => {
+    // 注册表里什么都没有（条目全靠扫描登记）——归一若排在合并之后，
+    // 会先按大写塞进一个条目、再把目录改名，终态留下对不上的条目。
+    await seedPersonaDir('Default', { name: 'Default', createdAt: '2026-11-10T01:00:00.000Z' }, '# 人格 (soul)\n\n- x\n')
+    await seedPersonaDir('工作', { name: '工作', createdAt: '2026-11-10T02:00:00.000Z' })
+
+    const fresh = makeStore()
+    await fresh.ready
+    const registry = await readRegistry()
+    assert.deepEqual(registry.personas.map((item) => item.slug), ['default', '工作'])
+    assert.equal(registry.personas.filter((item) => isDefaultLike(item.slug)).length, 1)
+    assert.equal(registry.personas.some((item) => /[A-Z]/.test(item.slug)), false) // 没有大写残留条目
+    assert.equal(registry.personas[0].name, 'Default') // 显示名照旧
+    assert.equal(registry.current, 'default') // current 补位时也落在小写上
+    await fresh.dispose()
+  })
+
+  test('legacy 迁移把 Default 搬进来时，defaultCurrent 跟着归一，current 不漂到别的人设', async () => {
+    // 迁移首选取 migrated[0]（这里是 Default）。归一把它改名成 default 之后，
+    // 若不映射 preferred，逐字比较会 miss 并回退「createdAt 最早」——current 就漂到 工作 上了。
+    await seedLegacyDir('Default', { name: 'Default', createdAt: '2026-11-10T09:00:00.000Z' })
+    await seedLegacyDir('工作', { name: '工作', createdAt: '2026-11-10T01:00:00.000Z' })
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.deepEqual(fresh.listPersonas().map((item) => item.slug), ['工作', 'default'])
+    assert.equal((await readRegistry()).current, 'default')
+    assert.deepEqual(fresh.currentPersona(), { slug: 'default', name: 'Default' })
+    assert.equal((await stat(join(personasRoot, 'default'))).isDirectory(), true)
+    await fresh.dispose()
+  })
 })
 
 describe('插件设置（v2）', () => {

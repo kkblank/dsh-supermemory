@@ -4,7 +4,8 @@
  * 覆盖（契约 §10 routes 组 + §5.4 + v2 §V2.3/§V2.4/§V2.8）：
  *   - 信任栅栏：非 loopback socket / 代理头 / cross-site / 异源 Origin / 非 loopback Host → 403。
  *   - 正常 loopback + 同源 → 200 且 `{ ok:true, data }`。
- *   - bootstrap v2 新结构；models 路由；settings PUT；personas GET/POST/PUT 与名称校验。
+ *   - bootstrap v2 新结构；models 路由；settings PUT；personas GET/POST/PUT 与名称校验，
+ *     v5 补 PATCH（改显示名）/ DELETE（删人设）：错误码映射、响应同构、关闭态不拦（§V5.7）。
  *   - doc 路由 persona 参数（兼容 presetId）、路径穿越 → 400；PUT 冲突 409；请求体超限 413。
  *   - 整理器：llm 缺失不抛；并发只跑一个；**只写 project（soul/user/global 输出被丢弃）**；
  *     模型选择四层回退（settings → config → currentRoute → agentDefaultModel）。
@@ -15,7 +16,8 @@
 
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { connect } from 'node:net'
+import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -200,6 +202,30 @@ function makePersonasFake(initial = [{ slug: 'default', name: '默认', createdA
       if (found === undefined) return { ok: false, code: 'NOT_FOUND', message: 'persona not found' }
       currentSlug = slug
       return { ok: true, persona: { slug: found.slug, name: found.name } }
+    },
+    // v5 §V5.2 语义的最小复刻：rename 只改 name；delete 先守 default，再摘条目并迁移 current。
+    rename: async (slug, name) => {
+      const display = String(name ?? '').trim()
+      if (display === '') return { ok: false, code: 'BAD_INPUT', message: 'name is required' }
+      const found = personas.find((persona) => persona.slug === slug)
+      if (found === undefined) return { ok: false, code: 'NOT_FOUND', message: 'persona not found' }
+      found.name = [...display].slice(0, 60).join('')
+      return { ok: true, persona: { ...found } }
+    },
+    remove: async (slug) => {
+      if (slug === 'default') return { ok: false, code: 'PERSONA_PROTECTED', message: 'default persona cannot be deleted' }
+      const index = personas.findIndex((persona) => persona.slug === slug)
+      if (index < 0) return { ok: false, code: 'NOT_FOUND', message: 'persona not found' }
+      const [removed] = personas.splice(index, 1)
+      if (currentSlug === slug) {
+        currentSlug = personas.find((persona) => persona.slug === 'default')?.slug ?? personas[0]?.slug ?? ''
+      }
+      const fallback = personas.find((persona) => persona.slug === currentSlug)
+      return {
+        ok: true,
+        deleted: { slug: removed.slug, name: removed.name },
+        current: fallback === undefined ? null : { slug: fallback.slug, name: fallback.name },
+      }
     },
   }
   return { api, personas, currentSlug: () => currentSlug }
@@ -917,11 +943,210 @@ describe('personas 路由', () => {
     assert.equal(noSlug.status, 400)
   })
 
-  it('DELETE 方法返回 405', async () => {
+  // ---------------------------------------------------------- v5：重命名与删除（契约 §V5.7）
+
+  it('PATCH 改显示名，响应体与 GET 同构（personas + current）', async () => {
+    const personas = makePersonasFake([
+      { slug: 'default', name: '默认', createdAt: '2026-11-01T00:00:00.000Z' },
+      { slug: 'work', name: '工作', createdAt: '2026-11-02T00:00:00.000Z' },
+    ])
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, makeDeps({ personas: personas.api }))
+    const result = await call(
+      routes,
+      ROUTE_PATHS.personas,
+      mockReq({ method: 'PATCH', headers: TRUSTED_HEADERS, body: JSON.stringify({ slug: 'work', name: '灰灰' }) }),
+    )
+    assert.equal(result.status, 200, result.raw)
+    // 响应形状必须与 GET 一致：只有 personas / current 两键，不设专用形状。
+    assert.deepEqual(Object.keys(result.json?.data ?? {}).sort(), ['current', 'personas'])
+    assert.deepEqual(
+      result.json?.data.personas.find((persona) => persona.slug === 'work'),
+      { slug: 'work', name: '灰灰', createdAt: '2026-11-02T00:00:00.000Z' },
+    )
+    // slug 与 current 都不因重命名而改变（§V5.0：只改显示名）。
+    assert.deepEqual(result.json?.data.current, { slug: 'default', name: '默认' })
+    assert.equal(result.json?.data.personas.length, 2)
+  })
+
+  it('PATCH 空 name / 缺 slug / 超 60 字符 → 400；未知 slug → 404', async () => {
+    const personas = makePersonasFake([
+      { slug: 'default', name: '默认', createdAt: '2026-11-01T00:00:00.000Z' },
+      { slug: 'work', name: '工作', createdAt: '2026-11-02T00:00:00.000Z' },
+    ])
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, makeDeps({ personas: personas.api }))
+    const cases = [
+      ['空 name', { slug: 'work', name: '   ' }, 400, 'BAD_INPUT'],
+      ['缺 name', { slug: 'work' }, 400, 'BAD_INPUT'],
+      ['缺 slug', { name: '灰灰' }, 400, 'BAD_INPUT'],
+      ['超长 name', { slug: 'work', name: 'x'.repeat(61) }, 400, 'BAD_INPUT'],
+      ['未知 slug', { slug: 'nope', name: '灰灰' }, 404, 'NOT_FOUND'],
+    ]
+    for (const [label, body, status, code] of cases) {
+      const result = await call(
+        routes,
+        ROUTE_PATHS.personas,
+        mockReq({ method: 'PATCH', headers: TRUSTED_HEADERS, body: JSON.stringify(body) }),
+      )
+      assert.equal(result.status, status, `${label} 应 ${status}，实际 ${result.status} ${result.raw}`)
+      assert.equal(result.json?.ok, false, label)
+      assert.equal(result.json?.code, code, label)
+    }
+    // 失败路径不得留下脏改名
+    assert.equal(personas.api.list()[1].name, '工作')
+  })
+
+  it('PATCH 恰好 60 字符可以改', async () => {
+    const personas = makePersonasFake([
+      { slug: 'default', name: '默认', createdAt: '2026-11-01T00:00:00.000Z' },
+      { slug: 'work', name: '工作', createdAt: '2026-11-02T00:00:00.000Z' },
+    ])
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, makeDeps({ personas: personas.api }))
+    const result = await call(
+      routes,
+      ROUTE_PATHS.personas,
+      mockReq({ method: 'PATCH', headers: TRUSTED_HEADERS, body: JSON.stringify({ slug: 'work', name: 'x'.repeat(60) }) }),
+    )
+    assert.equal(result.status, 200, result.raw)
+    assert.equal(result.json?.data.personas.find((persona) => persona.slug === 'work').name.length, 60)
+  })
+
+  it('DELETE 删除人设：列表少一个、响应同构、被删的是 current 时 current 迁移', async () => {
+    const personas = makePersonasFake([
+      { slug: 'default', name: '默认', createdAt: '2026-11-01T00:00:00.000Z' },
+      { slug: 'work', name: '工作', createdAt: '2026-11-02T00:00:00.000Z' },
+    ])
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, makeDeps({ personas: personas.api }))
+    // 先把 current 切到 work，验证删除 current 之后 current 迁到 default
+    const switched = await call(
+      routes,
+      ROUTE_PATHS.personas,
+      mockReq({ method: 'PUT', headers: TRUSTED_HEADERS, body: JSON.stringify({ slug: 'work' }) }),
+    )
+    assert.equal(switched.status, 200, switched.raw)
+
+    const result = await call(
+      routes,
+      ROUTE_PATHS.personas,
+      mockReq({ method: 'DELETE', headers: TRUSTED_HEADERS, body: JSON.stringify({ slug: 'work' }) }),
+    )
+    assert.equal(result.status, 200, result.raw)
+    assert.deepEqual(Object.keys(result.json?.data ?? {}).sort(), ['current', 'personas'])
+    assert.deepEqual(result.json?.data.personas, [
+      { slug: 'default', name: '默认', createdAt: '2026-11-01T00:00:00.000Z' },
+    ])
+    assert.deepEqual(result.json?.data.current, { slug: 'default', name: '默认' })
+    assert.equal(personas.currentSlug(), 'default')
+  })
+
+  it('DELETE 支持纯 query 形态 ?slug=（空 body 也可用）', async () => {
+    const personas = makePersonasFake([
+      { slug: 'default', name: '默认', createdAt: '2026-11-01T00:00:00.000Z' },
+      { slug: 'tmp', name: '临时', createdAt: '2026-11-03T00:00:00.000Z' },
+    ])
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, makeDeps({ personas: personas.api }))
+    const result = await call(
+      routes,
+      ROUTE_PATHS.personas,
+      mockReq({
+        method: 'DELETE',
+        headers: TRUSTED_HEADERS,
+        url: `/api/dsh-supermemory/personas?slug=${encodeURIComponent('tmp')}`,
+      }),
+    )
+    assert.equal(result.status, 200, result.raw)
+    assert.equal(result.json?.data.personas.length, 1)
+    assert.equal(result.json?.data.personas[0].slug, 'default')
+  })
+
+  it('DELETE 缺 slug → 400；default → 409 PERSONA_PROTECTED；未知 slug → 404', async () => {
+    const personas = makePersonasFake([
+      { slug: 'default', name: '默认', createdAt: '2026-11-01T00:00:00.000Z' },
+      { slug: 'work', name: '工作', createdAt: '2026-11-02T00:00:00.000Z' },
+    ])
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, makeDeps({ personas: personas.api }))
+
+    const noSlug = await call(
+      routes,
+      ROUTE_PATHS.personas,
+      mockReq({ method: 'DELETE', headers: TRUSTED_HEADERS, body: '{}' }),
+    )
+    assert.equal(noSlug.status, 400, noSlug.raw)
+    assert.equal(noSlug.json?.code, 'BAD_INPUT')
+
+    const protectedOne = await call(
+      routes,
+      ROUTE_PATHS.personas,
+      mockReq({ method: 'DELETE', headers: TRUSTED_HEADERS, body: JSON.stringify({ slug: 'default' }) }),
+    )
+    assert.equal(protectedOne.status, 409, protectedOne.raw)
+    assert.equal(protectedOne.json?.code, 'PERSONA_PROTECTED')
+    assert.equal(protectedOne.json?.ok, false)
+    // Default 禁删：列表仍是两个
+    assert.equal(protectedOne.json?.data, undefined, '失败响应不应带 data')
+    assert.equal(personas.api.list().length, 2)
+
+    const unknown = await call(
+      routes,
+      ROUTE_PATHS.personas,
+      mockReq({ method: 'DELETE', headers: TRUSTED_HEADERS, body: JSON.stringify({ slug: 'nope' }) }),
+    )
+    assert.equal(unknown.status, 404, unknown.raw)
+    assert.equal(unknown.json?.code, 'NOT_FOUND')
+  })
+
+  it('关闭态（enabled:false）下 PATCH / DELETE 仍然放行——v3 铁律', async () => {
+    const personas = makePersonasFake([
+      { slug: 'default', name: '默认', createdAt: '2026-11-01T00:00:00.000Z' },
+      { slug: 'work', name: '工作', createdAt: '2026-11-02T00:00:00.000Z' },
+    ])
+    const { ctx, routes } = makeCtx()
+    installRoutes(
+      ctx,
+      makeDeps({ isEnabled: () => false, personas: personas.api }),
+    )
+    const renamed = await call(
+      routes,
+      ROUTE_PATHS.personas,
+      mockReq({ method: 'PATCH', headers: TRUSTED_HEADERS, body: JSON.stringify({ slug: 'work', name: '灰灰' }) }),
+    )
+    assert.equal(renamed.status, 200, `关闭态 PATCH 不得被拦，实际 ${renamed.status} ${renamed.raw}`)
+    assert.equal(renamed.json?.code, undefined)
+    assert.equal(renamed.json?.data.personas.find((persona) => persona.slug === 'work').name, '灰灰')
+
+    const removed = await call(
+      routes,
+      ROUTE_PATHS.personas,
+      mockReq({ method: 'DELETE', headers: TRUSTED_HEADERS, body: JSON.stringify({ slug: 'work' }) }),
+    )
+    assert.equal(removed.status, 200, `关闭态 DELETE 不得被拦，实际 ${removed.status} ${removed.raw}`)
+    assert.equal(removed.json?.code, undefined)
+    assert.equal(removed.json?.data.personas.length, 1)
+  })
+
+  it('关闭态下 PERSONA_PROTECTED 仍映射 409（不被 PLUGIN_DISABLED 抢先）', async () => {
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, makeDeps({ isEnabled: () => false }))
+    const result = await call(
+      routes,
+      ROUTE_PATHS.personas,
+      mockReq({ method: 'DELETE', headers: TRUSTED_HEADERS, body: JSON.stringify({ slug: 'default' }) }),
+    )
+    assert.equal(result.status, 409, result.raw)
+    assert.equal(result.json?.code, 'PERSONA_PROTECTED')
+  })
+
+  it('未知 method 仍走 405 兜底（v5 起 DELETE 已合法，改用 OPTIONS 守兜底）', async () => {
     const { ctx, routes } = makeCtx()
     installRoutes(ctx, makeDeps())
-    const result = await call(routes, ROUTE_PATHS.personas, mockReq({ method: 'DELETE', headers: TRUSTED_HEADERS }))
-    assert.equal(result.status, 405)
+    const result = await call(routes, ROUTE_PATHS.personas, mockReq({ method: 'OPTIONS', headers: TRUSTED_HEADERS }))
+    assert.equal(result.status, 405, result.raw)
+    assert.equal(result.json?.code, 'METHOD_NOT_ALLOWED')
   })
 })
 
@@ -1176,6 +1401,266 @@ describe('真实回环 HTTP', () => {
       assert.ok(Array.isArray(json.data.personas))
     } finally {
       await new Promise((resolve) => server.close(resolve))
+    }
+  })
+
+  /**
+   * 起一个真实的 node:http 服务，把已注册路由按精确路径分发（与宿主的 kind:'exact' 同构）。
+   * @param {Map<string, Function>} routes - 路由表。
+   * @param {string[]} hits - 出参：每进入一次 handler 追加一条 `METHOD url`，用于断言「有没有进 handler」。
+   * @returns {Promise<{port: number, close: () => Promise<unknown>}>} 端口与关闭函数。
+   */
+  async function listen(routes, hits) {
+    const server = createServer((req, res) => {
+      hits.push(`${req.method} ${req.url}`)
+      const handler = routes.get(String(req.url).split('?')[0])
+      if (handler === undefined) {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end('{"ok":false,"error":"no route"}')
+        return
+      }
+      void handler(req, res)
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    return {
+      port: server.address().port,
+      close: () => new Promise((resolve) => server.close(resolve)),
+    }
+  }
+
+  /**
+   * 用 node:net 手写请求行，把**未经 percent 编码的裸 UTF-8 字节**送上线路。
+   *
+   * 必须绕开 fetch 与 http.request：两者都会先把非 ASCII 字符百分号编码（实测 fetch 发裸中文，
+   * 到达 handler 时已变成 `%E4%B8%B4...`），只有裸 socket 才复现得出 curl 那种「请求行里就是
+   * UTF-8 字节」的形态——而这正是被 Node 的 HTTP parser（llhttp）拒绝的形态。
+   * @param {number} port - 端口。
+   * @param {string} target - 原样写进请求行的目标，可含裸中文。
+   * @param {string} [method] - 请求方法。
+   * @returns {Promise<{status: number, statusLine: string, body: string, bytes: number}>} 原始响应。
+   */
+  function sendRawRequestLine(port, target, method = 'DELETE') {
+    return new Promise((resolve, reject) => {
+      const socket = connect(port, '127.0.0.1')
+      let buffer = Buffer.alloc(0)
+      const finish = () => {
+        socket.destroy()
+        // 先按 latin1 取原文：任何解码都可能掩盖「parser 根本没生成响应」这个事实
+        const text = buffer.toString('latin1')
+        const split = text.indexOf('\r\n\r\n')
+        const match = text.match(/^HTTP\/[\d.]+ (\d+)/u)
+        resolve({
+          status: match === null ? 0 : Number(match[1]),
+          statusLine: (text.match(/^HTTP\/[\d.]+ \d+[^\r]*/u) ?? ['<无状态行：连接被直接掐断>'])[0],
+          body: (() => {
+            if (split < 0) return ''
+            const tail = Buffer.from(text.slice(split + 4), 'latin1').toString('utf8')
+            // 本用例只打「parser 层 400」，它不带 body；chunked 的空体形态也一并视作空
+            return tail === '0\r\n\r\n' ? '' : tail
+          })(),
+          bytes: buffer.length,
+        })
+      }
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk])
+      })
+      socket.on('close', finish)
+      socket.on('error', reject)
+      socket.setTimeout(5000, finish)
+      socket.write(`${method} ${target} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAccept: */*\r\nConnection: close\r\n\r\n`)
+    })
+  }
+
+  it('中文 slug 经百分号编码的 query 形态 DELETE：200 且磁盘目录真的消失（真实 store）', async () => {
+    // 断言 ENOENT 必须真落盘，所以用独立临时 store，不碰文件级共享 store，避免污染其它用例。
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-sm-routes-cn-'))
+    const root = join(dir, 'personas')
+    const config = resolveConfig({ presetsRoot: root, personasRoot: root })
+    const cnStore = createStore({ dshHome: dir, presetsRoot: root, personasRoot: root, config, logger: { warn() {}, info() {} } })
+    try {
+      if (cnStore?.ready !== undefined) await cnStore.ready
+      await cnStore.createPersona('Default')
+      const created = await cnStore.createPersona('临时验证改名后')
+      assert.equal(created?.ok, true, `夹具建人设失败：${JSON.stringify(created)}`)
+      const slug = created.persona.slug
+      assert.ok(/[^\u0000-\u007F]/u.test(slug), `夹具要求 slug 含非 ASCII 字符，实际：${slug}`)
+      const dirPath = join(root, slug)
+      assert.ok((await stat(dirPath)).isDirectory(), '删除前该人设目录必须存在')
+
+      const { ctx, routes } = makeCtx()
+      installRoutes(
+        ctx,
+        makeDeps({
+          store: cnStore,
+          personasRoot: root,
+          dshHome: dir,
+          personas: {
+            list: () => cnStore.listPersonas(),
+            current: () => cnStore.currentPersona(),
+            create: (name) => cnStore.createPersona(name),
+            select: (personaSlug) => cnStore.setCurrentPersona(personaSlug),
+            rename: (personaSlug, displayName) => cnStore.renamePersona(personaSlug, displayName),
+            remove: (personaSlug) => cnStore.deletePersona(personaSlug),
+          },
+        }),
+      )
+      const hits = []
+      const { port, close } = await listen(routes, hits)
+      try {
+        // 关键：encodeURIComponent 之后才是能在请求行里活下来的形态
+        const response = await fetch(`http://127.0.0.1:${port}/api/dsh-supermemory/personas?slug=${encodeURIComponent(slug)}`, {
+          method: 'DELETE',
+        })
+        const json = await response.json()
+        assert.equal(response.status, 200, `编码 query 的中文 slug DELETE 必须 200，实际：${JSON.stringify(json)}`)
+        assert.equal(json.ok, true)
+        // 响应体仍与 GET 同构
+        assert.deepEqual(Object.keys(json.data ?? {}).sort(), ['current', 'personas'])
+        assert.equal(json.data.personas.some((persona) => persona.slug === slug), false, '列表里不应再有这个 slug')
+        assert.equal(hits.length, 1, `应恰好进入一次 handler，实际：${JSON.stringify(hits)}`)
+        // §V5.2 的删除要连目录一起消失
+        await assert.rejects(
+          async () => stat(dirPath),
+          (error) => error?.code === 'ENOENT',
+          '删除后人设目录必须 ENOENT（含 history/ 一并消失）',
+        )
+      } finally {
+        await close()
+      }
+    } finally {
+      await cnStore.dispose?.()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('含 % 的 slug 经编码 query 删除：删的是它自己，不是二次解码撞上的兄弟（§V5.4 不得再解一次）', async () => {
+    // 夹具走 reconcileRegistry 的扫盘登记：personaSlug 会把 '%' 换成 '-'，所以 createPersona
+    // 造不出含 % 的 slug；而手工建目录 / 从别处拷 personas/ 目录会被原样登记进注册表——
+    // §V5.2「逐字匹配、不做归一化」要守的正是这一类 slug。
+    const victim = '50%25测试' // 要被删除的
+    const sibling = '50%测试' // 多解一次 percent 就会撞上的兄弟
+    // 本用例的立论基础，先自证：对 victim 多解一次，结果正好等于 sibling。
+    // 将来若有人改了这两个常量导致等式不成立，这句话会立刻说明「夹具失效」而不是让断言静默失去意义。
+    assert.equal(
+      decodeURIComponent(decodeURIComponent(encodeURIComponent(victim))),
+      sibling,
+      '夹具前提：二次解码 victim 必须正好得到 sibling，否则本用例测不到「删错人设」',
+    )
+
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-sm-routes-pct-'))
+    const root = join(dir, 'personas')
+    const victimDir = join(root, victim)
+    const siblingDir = join(root, sibling)
+    await mkdir(victimDir, { recursive: true })
+    await mkdir(siblingDir, { recursive: true })
+    const config = resolveConfig({ presetsRoot: root, personasRoot: root })
+    const pctStore = createStore({ dshHome: dir, presetsRoot: root, personasRoot: root, config, logger: { warn() {}, info() {} } })
+    try {
+      if (pctStore?.ready !== undefined) await pctStore.ready
+      const registered = pctStore.listPersonas().map((persona) => persona.slug)
+      assert.ok(
+        registered.includes(victim) && registered.includes(sibling),
+        `夹具：reconcile 必须原样登记两个含 % 的 slug（不归一化），实际：${JSON.stringify(registered)}`,
+      )
+
+      const { ctx, routes } = makeCtx()
+      installRoutes(
+        ctx,
+        makeDeps({
+          store: pctStore,
+          personasRoot: root,
+          dshHome: dir,
+          personas: {
+            list: () => pctStore.listPersonas(),
+            current: () => pctStore.currentPersona(),
+            create: (name) => pctStore.createPersona(name),
+            select: (personaSlug) => pctStore.setCurrentPersona(personaSlug),
+            rename: (personaSlug, displayName) => pctStore.renamePersona(personaSlug, displayName),
+            remove: (personaSlug) => pctStore.deletePersona(personaSlug),
+          },
+        }),
+      )
+      const hits = []
+      const { port, close } = await listen(routes, hits)
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/api/dsh-supermemory/personas?slug=${encodeURIComponent(victim)}`, {
+          method: 'DELETE',
+        })
+        const json = await response.json()
+        assert.equal(response.status, 200, `编码形态删除含 % 的 slug 必须 200，实际：${JSON.stringify(json)}`)
+        assert.equal(json.ok, true)
+
+        // ② 灵魂断言，放在最前：sibling 一个字节都不能少。多解一次 percent 就会让它变成被删的那个，
+        //    而响应依然是 200 + 同构体——静默删错数据，比删不掉严重一个数量级。
+        //    先探存在性再断言：直接 await stat 会让裸 ENOENT 抢在前面抛掉，盖掉这句要传达的因果。
+        let siblingAlive = false
+        try {
+          siblingAlive = (await stat(siblingDir)).isDirectory()
+        } catch {
+          siblingAlive = false
+        }
+        assert.ok(
+          siblingAlive,
+          `${sibling} 的目录不见了——它被当成删除目标删掉了。原因只可能是 slug 被多解了一次 percent：` +
+            `queryOf 已把 ${victim} 正确还原，若在其后再加一次 decodeURIComponent 就会得到 ${sibling}。`,
+        )
+        // ① victim 的目录真的没了
+        await assert.rejects(
+          async () => stat(victimDir),
+          (error) => error?.code === 'ENOENT',
+          '删除后 victim 目录必须 ENOENT',
+        )
+        // ③ 返回的列表里少的是 victim、留的是 sibling
+        const remaining = json.data.personas.map((persona) => persona.slug)
+        assert.equal(remaining.includes(victim), false, `响应列表里 victim 必须已被移除，实际：${JSON.stringify(remaining)}`)
+        assert.ok(remaining.includes(sibling), `响应列表里 sibling 必须还在，实际：${JSON.stringify(remaining)}`)
+        assert.equal(hits.length, 1, `应恰好进入一次 handler，实际：${JSON.stringify(hits)}`)
+      } finally {
+        await close()
+      }
+    } finally {
+      await pctStore.dispose?.()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('裸 UTF-8 中文请求行：被 Node 的 HTTP parser 拒为 400 空响应且不进 handler（§V5.4 query 必须百分号编码）', async () => {
+    const slug = '临时验证改名后'
+    // 局部 personas 夹具：只额外记录 remove 收到的 slug，用来证明 percent-decode 逐字还原。
+    // 断言不借用真实 store 的 error 文案——那是 store 的自由，不是路由层的契约。
+    const removedWith = []
+    const personas = {
+      ...makePersonasFake().api,
+      remove: async (personaSlug) => {
+        removedWith.push(personaSlug)
+        return { ok: false, code: 'NOT_FOUND', message: 'persona not found' }
+      },
+    }
+    const { ctx, routes } = makeCtx()
+    const hits = []
+    installRoutes(ctx, makeDeps({ personas }))
+    const { port, close } = await listen(routes, hits)
+    try {
+      const raw = await sendRawRequestLine(port, `/api/dsh-supermemory/personas?slug=${slug}`)
+      assert.equal(raw.status, 400, `裸非 ASCII 请求行必须 400，实际状态行：${raw.statusLine}（${raw.bytes} 字节）`)
+      // 空 body 是「parser 层拒绝」的唯一特征：插件自己的 400 一定带 {"ok":false,...,"code":"BAD_INPUT"}
+      assert.equal(raw.body, '', `必须是空响应体（区别于插件的 400 JSON）——本断言的存在意义就是拦住「加 decodeURIComponent 去修」的改法，实际收到：${JSON.stringify(raw.body)}`)
+      assert.deepEqual(hits, [], '裸非 ASCII 请求行不得进入插件 handler')
+      assert.deepEqual(removedWith, [], '裸非 ASCII 请求行不得触发删除')
+
+      // 对照组：同一个中文 slug 一经百分号编码，立刻正常送达 handler
+      const encoded = await fetch(`http://127.0.0.1:${port}/api/dsh-supermemory/personas?slug=${encodeURIComponent(slug)}`, {
+        method: 'DELETE',
+      })
+      const json = await encoded.json()
+      assert.equal(encoded.status, 404, `编码形态应送达 handler 并因查表未命中而 404，实际：${JSON.stringify(json)}`)
+      assert.equal(json.code, 'NOT_FOUND')
+      assert.equal(hits.length, 1, `编码形态应恰好进入一次 handler，实际：${JSON.stringify(hits)}`)
+      assert.match(hits[0], /slug=%E4%B8%B4/u, 'handler 收到的 req.url 里应是百分号编码形态')
+      // 决定性一条：queryOf 那唯一一次 percent-decode 把中文逐字还原后才交给 store
+      assert.deepEqual(removedWith, [slug], 'store 收到的 slug 必须与中文原文逐字相等（§V5.2 逐字匹配、不做归一化）')
+    } finally {
+      await close()
     }
   })
 })

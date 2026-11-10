@@ -85,11 +85,20 @@
     "personaCancel": "Cancel",
     "personaCreateFailed": "Could not create persona: {error}",
     "personaSwitched": "Persona switched.",
+    "personaRename": "Rename",
+    "personaRenamed": "Persona renamed.",
+    "personaRenameFailed": "Could not rename persona: {error}",
+    "personaDelete": "Delete persona",
+    "personaDeleteConfirm": "Delete “{name}” together with its soul, user profile and global memory? This cannot be undone.",
+    "personaDeleted": "The persona and its memory files are gone.",
+    "personaDeleteFailed": "Could not delete persona: {error}",
+    "personaDeleteLocked": "The Default persona cannot be deleted.",
     "digest": {
       "model": "Digest model",
       "modelFollow": "Follow current session",
       "modelSaved": "Digest model saved.",
-      "modelSaveFailed": "Could not save the digest model: {error}"
+      "modelSaveFailed": "Could not save the digest model: {error}",
+      "consolidation": "consolidated: +{added} merged {merged} dropped {dropped} kept {kept}"
     },
     "projectAuto": "Synced from your workspace."
   }
