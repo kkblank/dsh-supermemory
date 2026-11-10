@@ -15,6 +15,10 @@
         injectMaxBytes: 24000
         autoDigest: true
         digestEveryTurns: 5
+        # 整理输入上限：默认 120000 实测过大——本机 vllm/qwen 面对接近该体积的整理输入会稳定
+        # 返回空文本（报告表现为「digest 输出为空」），20000 实测可用。超长会话里 120000 这个
+        # 默认值会让自动整理静默失败，故显式压低。换用非思考型整理模型后可考虑放宽。
+        digestMaxInputBytes: 20000
         digestPressureRatio: 0.75
         # 子智能体默认不带记忆。写显式 false 是为了让默认值在配置文件里可见，不必去翻
         # zod default。实测本机 link 安装方式下配置树从未落过 supermemory 的 config 段，
