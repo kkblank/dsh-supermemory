@@ -327,8 +327,8 @@ function bootstrapData(overrides = {}) {
     projects: [],
     active: {},
     presets: [],
-    presetsRoot: '/home/fxy/.dsh/supermemory/personas',
-    dshHome: '/home/fxy/.dsh',
+    presetsRoot: '/home/user/.dsh/supermemory/personas',
+    dshHome: '/home/user/.dsh',
     config: { injectMaxBytes: 24000, systemPromptMaxBytes: 12000, autoDigest: true },
     digestSettings: { enabled: true, digestProvider: '', digestModel: '' },
     ...overrides,
@@ -344,7 +344,7 @@ const DOC_BODY = {
     content: '## 条目\n',
     bytes: 16,
     mtimeMs: 1000,
-    path: '/home/fxy/.dsh/supermemory/personas/default/global-memory.md',
+    path: '/home/user/.dsh/supermemory/personas/default/global-memory.md',
   },
 }
 

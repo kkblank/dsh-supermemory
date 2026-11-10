@@ -3,3 +3,31 @@ node_modules/
 
 # 运行期产生的记忆数据不应进仓库
 .dsh/
+
+# 记忆数据的兜底排除：正常落在 $DSH_HOME 下，只有把 personasRoot 配到仓库里
+# 才会在项目根生成这些。真实人格/画像/记忆属于私人内容，任何情况都不提交。
+/supermemory/
+/personas/
+soul.md
+user.md
+global-memory.md
+
+# 环境变量与本地覆盖配置
+.env
+.env.*
+*.local
+
+# 日志与打包产物
+*.log
+npm-debug.log*
+*.tgz
+dist/
+coverage/
+.nyc_output/
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

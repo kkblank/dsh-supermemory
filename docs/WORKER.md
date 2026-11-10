@@ -2,17 +2,15 @@
 
 ## 你是谁
 
-你是 `dsh-supermemory` 插件实现团队的成员。工作目录：
-`/home/fxy/data/workspace/dsh-plugin/dsh-supermemory`
+你是 `dsh-supermemory` 插件实现团队的成员。工作目录：本仓库根目录。
 
 Lead 已完成：`package.json`、`cordis.patch.yml`、`lib/index.js`、`docs/CONTRACT.md`。
 
 ## 唯一权威文档
 
 **`docs/CONTRACT.md`** 是你的实现契约。开工前**完整读一遍**，
-然后只做契约里分给你的那部分。`PLAN.md` 在
-`/home/fxy/.dsh/attachments/v1/files/43/43abe1d21c932fe902addb9130044e6087eb35a6bf1c51145b8a8edc19e6e0fe/PLAN.md`
-（只读需求背景，冲突时以 CONTRACT.md 为准）。
+然后只做契约里分给你的那部分。需求背景 `PLAN.md` 不随仓库分发
+（只读参考，冲突时以 CONTRACT.md 为准）。
 
 ## 三条铁律
 
@@ -43,7 +41,7 @@ $ node -e "import('@deepseek-ai/dsh-llm')"   → ERR_MODULE_NOT_FOUND
 ### 3. 自检通过再交
 
 ```bash
-cd /home/fxy/data/workspace/dsh-plugin/dsh-supermemory
+cd /path/to/dsh-supermemory        # 本仓库根目录
 node --check lib/你的文件.js          # 每个文件都要过
 node --test test/你的测试.js          # 你负责的测试必须全绿
 ```

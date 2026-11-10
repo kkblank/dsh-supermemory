@@ -42,7 +42,7 @@
 
 ```js
 plugin_manager({ action: 'install_bundle',
-                 target: '/home/fxy/data/workspace/dsh-plugin/dsh-supermemory' })
+                 target: '/absolute/path/to/dsh-supermemory' })
 ```
 
 安装后确认返回 `application: applied`，然后刷新页面。
