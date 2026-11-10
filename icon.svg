@@ -1,0 +1,8 @@
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>dsh-supermemory</title>
+  <path d="M9 7.5C9 6.67 9.67 6 10.5 6H24.5C25.33 6 26 6.67 26 7.5V28.5C26 29.33 25.33 30 24.5 30H10.5C9.67 30 9 29.33 9 28.5V7.5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M13.5 6V30" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="19.5" cy="13" r="1.6" fill="currentColor"/>
+  <circle cx="23" cy="18" r="1.6" fill="currentColor"/>
+  <circle cx="19.5" cy="23" r="1.6" fill="currentColor"/>
+</svg>

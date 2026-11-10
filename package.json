@@ -1,0 +1,41 @@
+{
+  "name": "dsh-supermemory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH memory plugin: persona, user profile, global memory and project memory injected into every session, with a Web panel and editing.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    },
+    "engines": {
+      "dsh": ">=0.2.2-rc.1"
+    }
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,5 @@
+# 本地自测依赖（Lead 从 profile 复制，仅用于 node --test 解析 @deepseek-ai/schemastery）
+node_modules/
+
+# 运行期产生的记忆数据不应进仓库
+.dsh/

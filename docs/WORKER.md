@@ -1,0 +1,80 @@
+# 队员须知（先读我，再读 CONTRACT.md）
+
+## 你是谁
+
+你是 `dsh-supermemory` 插件实现团队的成员。工作目录：
+`/home/fxy/data/workspace/dsh-plugin/dsh-supermemory`
+
+Lead 已完成：`package.json`、`cordis.patch.yml`、`lib/index.js`、`docs/CONTRACT.md`。
+
+## 唯一权威文档
+
+**`docs/CONTRACT.md`** 是你的实现契约。开工前**完整读一遍**，
+然后只做契约里分给你的那部分。`PLAN.md` 在
+`/home/fxy/.dsh/attachments/v1/files/43/43abe1d21c932fe902addb9130044e6087eb35a6bf1c51145b8a8edc19e6e0fe/PLAN.md`
+（只读需求背景，冲突时以 CONTRACT.md 为准）。
+
+## 三条铁律
+
+### 1. 不要 import 任何 `@deepseek-ai/*` 宿主包
+
+本工作区**解析不到** `@deepseek-ai/dsh-*` 和 `@deepseek-ai/cordis`。已实测：
+
+```
+$ node -e "import('@deepseek-ai/dsh-llm')"   → ERR_MODULE_NOT_FOUND
+```
+
+- 唯一例外：`@deepseek-ai/schemastery`，且**只在 `lib/host/config.js`** 里 import。
+  Lead 已经把它和它的依赖 `@deepseek-ai/cosmokit` 复制到本包
+  `node_modules/@deepseek-ai/` 下，所以本地 `node --test` 能解析。
+  **不要**把 `node_modules` 加进 git / 打包 / `files`，那是本地自测用的。
+- 宿主能力一律 `ctx.get('serviceName')` 可选获取。
+- 构造消息对象手写普通对象，不要 import `createUserMessage`。
+- 客户端 `lib/client.js` 只有 `require('react')`。
+
+写代码时如果发现"必须 import 宿主包才能做"，**停下来，在完成报告里写明**，
+不要自己想办法绕（比如写个假的 node_modules 或改 package.json 加依赖）。
+
+### 2. 只改你负责的文件
+
+契约 §1 有完整的文件归属表。改别人的文件会导致冲突。
+需要别人改什么 → 在完成报告里提出来，不要自己动手。
+
+### 3. 自检通过再交
+
+```bash
+cd /home/fxy/data/workspace/dsh-plugin/dsh-supermemory
+node --check lib/你的文件.js          # 每个文件都要过
+node --test test/你的测试.js          # 你负责的测试必须全绿
+```
+
+测试用 `node:test` + `node:assert/strict`，不装任何依赖。
+测试涉及文件系统时用 `node:fs.mkdtemp` 建临时目录，`after` 里清理。
+
+## 怎么干活
+
+1. 在团队任务板上找到分给你的任务，`claim` 它。
+2. 读 CONTRACT.md 对应章节。
+3. 写代码 + 测试。
+4. 自检（语法 + 测试）。
+5. `complete` 任务，然后给 Lead 发一条 `send_message`，内容包含：
+   - 你改了哪些文件（路径列表）
+   - 测试跑了什么、结果如何（贴关键输出）
+   - 契约里没写清、你自行决定的点
+   - 你发现但没改的别人的问题
+   - 已知限制 / 未验证的部分
+
+## 代码风格
+
+- ESM，纯 JS，不用 TypeScript，无构建步骤。
+- 中文注释，JSDoc 用 `@param` / `@returns`。
+- 单文件 ≤ 400 行，超了就拆（拆出的文件仍要在你的 scope 内）。
+- 所有 IO 错误必须捕获并转成返回值里的错误码，**不要抛**到宿主。
+- 时间统一 ISO 8601 UTC：`new Date().toISOString()`。
+
+## 关于运行环境
+
+- Node v24.22.2，`node --test` 可用。
+- 不要 `npm install` / `pnpm add` 任何包。
+- 不要修改 `~/.dsh` 下任何东西。
+- 不要安装插件（那是 Lead 的活）。

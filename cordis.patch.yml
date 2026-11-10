@@ -1,0 +1,17 @@
+# dsh-supermemory — DSH 记忆插件（bundle patch）
+#
+# 把插件挂进 profile 的配置树。name 必须与安装后的包名完全一致。
+#
+# 安装（在 DSH 运行中也可，通过 plugin_manager install_bundle 指向本目录）：
+
+- insert:
+    - id: supermemory
+      name: dsh-supermemory
+      config:
+        enabled: true
+        systemPromptMaxBytes: 12000
+        injectMaxBytes: 24000
+        autoDigest: true
+        digestEveryTurns: 5
+        digestPressureRatio: 0.75
+        injectIntoSubagents: true
