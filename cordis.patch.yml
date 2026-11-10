@@ -15,10 +15,11 @@
         injectMaxBytes: 24000
         autoDigest: true
         digestEveryTurns: 5
-        # 整理输入上限：默认 120000 实测过大——本机 vllm/qwen 面对接近该体积的整理输入会稳定
-        # 返回空文本（报告表现为「digest 输出为空」），20000 实测可用。超长会话里 120000 这个
-        # 默认值会让自动整理静默失败，故显式压低。换用非思考型整理模型后可考虑放宽。
-        digestMaxInputBytes: 20000
+        # 整理模型（本机 vllm/qwen）是推理模型：输出预算要先给思考用完才轮到正文。实测思考约
+        # 需 6000 tokens，故预算必须远大于正文本身，否则思考没写完就截断、正文为空。
+        # 输入也别塞满：整理不需要 256K 窗口，输入越小思考越短、也越省。
+        digestMaxInputBytes: 24000
+        digestMaxOutputTokens: 8000
         digestPressureRatio: 0.75
         # 子智能体默认不带记忆。写显式 false 是为了让默认值在配置文件里可见，不必去翻
         # zod default。实测本机 link 安装方式下配置树从未落过 supermemory 的 config 段，
@@ -32,5 +33,6 @@
         digestConsolidateMinEntries: 20
         digestConsolidateMinBytes: 12288
         digestConsolidateCooldownMs: 21600000
-        digestConsolidateMaxOutputTokens: 6000
+        # 整编要重写整份记忆，思考量比追加模式大得多（实测一次 5942 tokens 思考 + 1.7KB 正文）。
+        digestConsolidateMaxOutputTokens: 16000
         digestSnapshotKeep: 3

@@ -122,6 +122,8 @@ async function makeDigestHarness(options = {}) {
   let lastStreamParams = null
   // 整编用例要在读到条目 id 之后才能拼出模型输出，故留出可换文案的口子。
   let llmText = options.llmText ?? DIGEST_JSON
+  /** 假流的收尾原因；`length` 用来模拟输出被 maxTokens 截断。 */
+  const finishKind = options.finishKind ?? 'stop'
   // 关键：stream 必须**同步**返回 AsyncIterable，不能是 Promise。
   const llm = {
     stream(params) {
@@ -129,7 +131,7 @@ async function makeDigestHarness(options = {}) {
       lastStreamParams = params
       return (async function* () {
         yield { type: 'text-delta', index: 0, text: llmText }
-        yield { type: 'finish', reason: { kind: 'stop' } }
+        yield { type: 'finish', reason: { kind: finishKind } }
       })()
     },
   }
@@ -828,4 +830,14 @@ test('冷却期内下一次整理退回追加：不重复整编', async (t) => {
   assert.equal(second.ok, true, JSON.stringify(second))
   assert.equal(second.mode, 'append', '刚整编过就落在冷却期里，第二次必须走追加')
   assert.ok((await readProject(h)).includes('自动整理新增的事实'), '追加路径照常写回')
+})
+
+test('输出被 maxTokens 截断要报出可行动的错误，不能含糊成「输出为空」', async (t) => {
+  // 推理模型的真实死法：思考把预算用光，正文一个字没产出，流以 length 收尾。
+  const h = await makeDigestHarness({ finishKind: 'length', llmText: '' })
+  t.after(h.cleanup)
+
+  const record = await runManual(h)
+  assert.equal(record.ok, false)
+  assert.match(String(record.error), /maxTokens/, JSON.stringify(record))
 })
