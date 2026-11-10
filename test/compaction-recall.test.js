@@ -34,6 +34,14 @@ function makeSession(options = {}) {
   let nodes = []
   let replaceGeneration = 0
   const surfaceAvailable = options.surfaceAvailable !== false
+  // 宿主在第一个 step 内写好 system/message 并登记为 surface 的受保护头部。桩必须
+  // 带上它：inject 的 hasSystemHead 门控靠它放行，缺了就是在测一个不可能的环境。
+  events.push({
+    type: 'system/message',
+    seq: 0,
+    data: { role: 'system', content: [{ type: 'text', text: 'system prompt' }] },
+  })
+  nodes.push(0)
 
   const session = {
     get seq() {
@@ -253,17 +261,19 @@ test('compactionState：session 缺失 / 无 snapshotEvents / 抛错都降级为
 
 test('lastSnapshotEvent：遮蔽集能排除已被压缩吞掉的旧快照（surface 不可用时）', () => {
   const session = makeSession({ surfaceAvailable: false })
-  session.append(
+  // seq 由桩分配（events[0] 是宿主预置的 system/message），这里不硬编码数字：
+  // 真正要测的是遮蔽集语义，写死序号只会在夹具形态变动时误报。
+  const snapshotSeq = session.append(
     'user/message',
     { id: 'p1', role: 'user', content: [{ type: 'text', text: 'x' }], source: { kind: SOURCE_KIND, digest: 'D' } },
     { surfaceOp: 'append' },
-  )
+  ).seq
   // 不传遮蔽集：退回旧的宽松行为，能找到（这就是过去的误判来源）。
-  assert.equal(lastSnapshotEvent(session)?.seq, 0)
+  assert.equal(lastSnapshotEvent(session)?.seq, snapshotSeq)
   // 传入遮蔽集：同一条被吞掉的事件不再算存活。
-  assert.equal(lastSnapshotEvent(session, new Set([0])), undefined)
+  assert.equal(lastSnapshotEvent(session, new Set([snapshotSeq])), undefined)
   // 遮蔽集里没有它 → 仍算存活。
-  assert.equal(lastSnapshotEvent(session, new Set([7, 8]))?.seq, 0)
+  assert.equal(lastSnapshotEvent(session, new Set([7, 8]))?.seq, snapshotSeq)
 })
 
 // ——————————————————————————————————————————————

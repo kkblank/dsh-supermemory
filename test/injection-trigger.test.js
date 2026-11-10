@@ -23,7 +23,7 @@ import { appendEntries, emptyDocument, parseEntries } from '../lib/core/document
 import { resolveConfig } from '../lib/host/config.js'
 import { CONSOLIDATE_SYSTEM_PROMPT } from '../lib/host/digest-input.js'
 import { createDigestRunner } from '../lib/host/digest.js'
-import { EMPTY_DIGEST, EMPTY_SNAPSHOT_TEXT, installInjection, SNAPSHOT_NOTICE } from '../lib/host/inject.js'
+import { EMPTY_DIGEST, EMPTY_SNAPSHOT_TEXT, hasSystemHead, installInjection, SNAPSHOT_NOTICE } from '../lib/host/inject.js'
 
 /** 整理器固定返回的 JSON（v2：只允许 project 一条新增事实）。 */
 const DIGEST_JSON = '{"project":["自动整理新增的事实"]}'
@@ -383,11 +383,25 @@ test('上下文压力低于阈值（0.5 < 0.75）不触发', async (t) => {
 /**
  * 假 session：append-only 日志 + 当前 surface 节点，复刻宿主 replace 的硬校验。
  * @param {string} id - 会话 id。
+ * @param {{ systemHead?: boolean }} [options] - `systemHead: false` 模拟宿主还没写出
+ *   system/message 的最初那个 step——此时注入必须整体让路，抢跑会把会话永久写坏。
  * @returns {object} 假 session。
  */
-function makeSession(id) {
+function makeSession(id, options = {}) {
   const events = []
   let nodes = []
+  // 真实宿主在第一个 step 内就写好 system/message，并登记为 surface 的受保护头部，
+  // 此后一直挂在 nodes 上。桩默认带上它：inject 的头部门控（hasSystemHead）会挡住
+  // 全部注入，而那道门控正是「快照抢跑写坏会话」的修复本身。少了这条事件，测的就
+  // 不是宿主真实形态。
+  if (options.systemHead !== false) {
+    events.push({
+      type: 'system/message',
+      seq: 0,
+      data: { role: 'system', content: [{ type: 'text', text: 'system prompt' }] },
+    })
+    nodes.push(0)
+  }
   return {
     id,
     header: {},
@@ -396,6 +410,17 @@ function makeSession(id) {
     },
     snapshotEvents() {
       return events.slice()
+    },
+    /** 模拟宿主在后续 step 写出 system/message，即受保护头部落地。 */
+    seedSystemHead() {
+      const seq = events.length
+      events.push({
+        type: 'system/message',
+        seq,
+        data: { role: 'system', content: [{ type: 'text', text: 'system prompt' }] },
+      })
+      nodes.push(seq)
+      return seq
     },
     append(type, data, opts) {
       const seq = events.length
@@ -449,6 +474,8 @@ function makeSession(id) {
  * @param {object} [options]
  * @param {object} [options.config] - 覆盖配置。
  * @param {() => boolean} [options.isEnabled] - 假插件总开关（缺失视为「开启」）。
+ * @param {boolean} [options.systemHead] - 传 false 表示宿主还没写出 system/message，
+ *   即会话最初那个 step——此时注入必须整体让路。
  * @returns {Promise<object>} 夹具。
  */
 async function makeInjectionHarness(options = {}) {
@@ -464,7 +491,7 @@ async function makeInjectionHarness(options = {}) {
     logger: { warn() {} },
   })
   if (store?.ready !== undefined) await store.ready
-  const session = makeSession('sess-inject')
+  const session = makeSession('sess-inject', options)
   const scope = { persona: 'default', presetId: 'default', projectRoot: dir, projectName: 'proj' }
   const ctx = makeCtx({})
   const deps = {
@@ -526,6 +553,34 @@ test('首次 pre-step：恰好追加 1 条快照，source 结构与首行提示�
   const text = event.data.content[0].text
   assert.ok(text.startsWith(SNAPSHOT_NOTICE), '正文首行必须是「不是用户发言」提示')
   assert.ok(text.includes('喜欢深色主题'))
+})
+
+test('受保护头部未落地：pre-step 一个字都不写（抢跑一次就把整个会话永久写坏）', async (t) => {
+  const h = await makeInjectionHarness({ systemHead: false })
+  t.after(h.cleanup)
+  await h.seed('global', '喜欢深色主题')
+
+  await h.runPreStep()
+  assert.equal(h.session.allPluginEvents().length, 0, '宿主还没写 system/message，一条快照都不许落盘')
+  assert.equal(h.session.surface.nodes.length, 0, 'surface 的第一个位置必须留给宿主的 system/message')
+
+  // 头部落地后，同一个会话下一轮照常补上——门控只是延后一轮，不会造成永久失忆。
+  h.session.seedSystemHead()
+  await h.runPreStep()
+  assert.equal(h.session.pluginSnapshots().length, 1, '头部落地后必须补注入')
+})
+
+test('hasSystemHead：读不到日志一律判 false（宁可不写，也不写坏会话）', () => {
+  assert.equal(hasSystemHead(undefined), false)
+  assert.equal(hasSystemHead(null), false)
+  assert.equal(hasSystemHead({}), false, '没有 snapshotEvents 的宿主按未就绪处理')
+  assert.equal(hasSystemHead({ snapshotEvents: () => { throw new Error('log corrupted') } }), false)
+  assert.equal(hasSystemHead({ snapshotEvents: () => [{ type: 'user/message' }] }), false)
+  assert.equal(
+    hasSystemHead({ snapshotEvents: () => [{ type: 'user/message' }, { type: 'system/message' }] }),
+    true,
+    'append-only 日志里写过就算就绪，不受压缩遮蔽影响',
+  )
 })
 
 test('内容不变：重复 pre-step 不追加、不 replace', async (t) => {

@@ -1771,3 +1771,49 @@ legacy 迁移后列表非空但没有默认人设时，现在也会补建，不�
 人设目录 `Default/` 会在下次启动时改名为 `default/`，注册表条目 `slug` 跟着变小写、
 `name` 保持 `Default`，面板下拉里那一行**看起来完全没变**；当前人设是 `工作`，不受影响。
 `工作` 等非默认人设一律不碰。
+
+---
+
+# V7 两处真实事故的契约固化（优先于前文，冲突时以本节为准）
+
+两处都不是「代码写错了」，而是「对宿主时序的假设错了」，所以都记成契约而不是补丁说明。
+
+## V7.1 `webServer` 是入口唯一的 inject 硬依赖（`lib/index.js`）
+
+`inject = ['webServer']`，**不许改回 `ctx.get` 现场捞**。
+
+cordis 的 `ctx.get(name)` 只返回 provider fiber 当前 active 的实现；没声明的服务捞得到
+捞不到，取决于 bundle 激活顺序。一旦捞空，`installRoutes` 一条路由都不注册且永不重试，
+而插件 fiber 仍显示 active——面板全部 HTTP 404，宿主日志零线索，只能从 404 反推。
+
+其余宿主服务（llm / tools / session / workspaceRegistry）仍全部经 `ctx.get` 可选获取，
+缺失时照常降级。代价：没有 webServer 的 profile 里整个插件不再激活。
+
+`installRoutes` 拿不到 webServer 时必须留一条 warn。**降级只意味着「不抛错」，不意味着
+「不吭声」**——静默正是这次事故藏了一整天的地方。
+
+## V7.2 快照绝不允许抢在受保护头部之前落盘（`lib/host/inject.js`）
+
+宿主 v4 日志的硬不变量（`dsh-session-format-v3-to-v4` 的 `foldSurface`）：**surface 的第一
+条记录必须是 `system/message`**，它被登记为「受保护头部」，其后任何 replace 都不许遮蔽它。
+违反的代价不是当轮报错，而是这个会话**此后每次加载都报**
+`system/message requires a protected first surface head`，无法自愈。
+
+宿主写 `system/message` 的时机在 step **内部**，而快照挂在 `agent/pre-step`，天然更早
+（实测相差约 5 毫秒）。谁先落地取决于异步快慢，是竞态——一次真实环境里 40 个会话中招 16 个。
+
+守则：pre-step 里 `hasSystemHead(session)` 为 false 时**一个字都不写**，直接放行 `next`。
+判据必须用 append-only 的 `snapshotEvents()`，不能用 `surface.nodes`——压缩会把整段区间从
+surface 上抹掉，用它会在压缩之后把注入永久卡死。已有过快照时 `system/message` 必然早已
+写过，门控自动放行，不影响压缩补偿重写。
+
+## V7.3 测试归属
+
+- `injection-trigger.test.js`：头部未落地时零写入、头部落地后补注入；`hasSystemHead` 的
+  四种读不到日志的入口一律判 false。三个 session 桩默认预置一条 `system/message`
+  占 `events[0]`——**桩不带它，就是在宿主不可能存在的形态里测试**；
+  `makeSession(id, { systemHead: false })` 只给专测门控的那条用例用。
+- `routes.test.js`：webServer 缺失必须「不抛错 + 恰好一条 warn」；走注入（`ctx.webServer`
+  而非 `ctx.get`）也要能注册满 7 条。
+- 序号一律取 `append` 的返回值，不硬编码数字：夹具预置事件会让 seq 位移，写死只会在夹具
+  变动时误报成回归。

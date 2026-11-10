@@ -38,6 +38,15 @@ import { installCommands, parseRememberInput } from '../lib/host/commands.js'
   function makeSession() {
     const events = []
     let nodes = []
+    // 宿主在第一个 step 内写好 system/message 并登记为 surface 的受保护头部，inject
+    // 的 hasSystemHead 门控靠它放行。直接塞进 events 而不走 append，避开只认
+    // user/message 的 assertMessageShape。
+    events.push({
+      type: 'system/message',
+      seq: 0,
+      data: { role: 'system', content: [{ type: 'text', text: 'system prompt' }] },
+    })
+    nodes.push(0)
 
     const assertMessageShape = (seq, type, data) => {
       assert.equal(type, 'user/message')
