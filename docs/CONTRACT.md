@@ -947,3 +947,118 @@ en/zh 两套必须键完全一致。
 - `test/trust-fence.test.js`：不变。
 
 **验收基线**：全部测试通过；`node --test` 用例数不减少。
+
+---
+
+# v3 变更：插件总开关（面板里的软开关）
+
+用户要求「设置 → 记忆」里放一个开关，关掉之后插件才不生效。本节定义它的语义、
+存储位置、接口与界面行为。**本节覆盖前文中「设置页只读」的表述**：设置页从此有一个
+可写控件（总开关），其余概览项仍然只读。
+
+## V3.1 两级开关是 AND 关系（最容易被误解的一点）
+
+| | `enabled`（cordis.patch.yml） | `enabled`（settings.json，v3 新增） |
+|---|---|---|
+| 层级 | 硬开关：cordis 插件配置 | 软开关：插件自己的运行时设置 |
+| 读取者 | `lib/index.js` 的 `apply(ctx, config)` | `deps.isEnabled()` → `store.readSettings().enabled` |
+| 关掉的效果 | `apply()` 直接 return：**一个监听/工具/路由/客户端入口都不装配**，面板打不开 | 能力层停摆，**路由与面板照常装配**，页面能进、记忆能读能改 |
+| 怎么改 | 改 yml + 重启/重载插件 | 设置页点一下即可，无需重启 |
+| 判定 | `if (!resolved.enabled) return` | `deps?.isEnabled?.() === false` 才拦 |
+
+**两者是 AND**：任一为 false，注入/工具/命令/自动整理都不工作；但只有软开关能保住面板
+可用。界面文案必须写清这点（`settings.enableHint`），否则用户会以为面板上关掉就等于
+插件已卸载。
+
+## V3.2 语义：关闭时到底停掉什么
+
+| 能力 | 关闭时行为 | 负责文件 |
+|---|---|---|
+| 系统提示 `supermemory:persona` section | `text()` 返回 `''`（不注入） | `lib/host/inject.js` |
+| `agent/pre-step` 记忆快照 | 直接返回 decision，**不写任何快照**；历史里已有的旧快照原样保留，不替换也不清理 | `lib/host/inject.js` |
+| `memory` 工具 | 返回 `{ ok:false, code:'PLUGIN_DISABLED' }`，不抛异常 | `lib/host/tools.js` |
+| `/remember`、`/memory-digest` | 回一句「插件已关闭」提示 | `lib/host/commands.js` |
+| 自动整理（轮次/压力触发） | `maybeTrigger` 直接跳过 | `lib/host/digest.js` |
+| 手动整理 `POST digest` | **409 + `code:'PLUGIN_DISABLED'`** | `lib/host/routes.js` |
+| 面板 HTTP（bootstrap/doc/runs/models/settings/personas） | **全部照常 200**，一个都不拦 | `lib/host/routes.js` |
+
+铁律：**关闭状态下面板必须还能看、还能改记忆内容**。任何 GET/PUT 都不得因为关闭而返回
+403/404——否则用户关掉之后再也打不开，只能去手改 `settings.json`。信任栅栏（403）与
+关闭无关，仍然对所有路由生效且优先级更高。
+
+## V3.3 存储
+
+```
+$DSH_HOME/supermemory/settings.json
+{ "version": 1, "enabled": true, "digestProvider": "", "digestModel": "" }
+```
+
+- 默认 `true`；文件缺失 / JSON 非法 / 读取抛错 → **一律回退 `true`**（绝不因读盘失败把插件
+  悄悄关掉，也不能把面板变成砖）。
+- 由 `lib/core/store.js` 读写（`DEFAULT_SETTINGS` / `normalizeSettings` / `writeSettings` /
+  `readSettings`），`lib/index.js` 以 `isEnabled: () => boolean` **同步**暴露给各能力层。
+- 非布尔的 `patch.enabled` 被 store 忽略（沿用「非法值忽略」策略）；routes 层更早一步，
+  直接 400 `BAD_INPUT`，让界面立刻看到原因。
+
+## V3.4 判定写法（硬约束）
+
+所有门控一律写成**只在明确 false 时拦截**：
+
+```js
+// routes 层
+function pluginEnabled() {
+  try {
+    return deps?.isEnabled?.() !== false
+  } catch {
+    return true
+  }
+}
+
+// 能力层等价写法
+if (deps.isEnabled?.() === false) return decision
+```
+
+**不得写成 `!deps.isEnabled()`**：既有测试的 mock `deps` 里没有 `isEnabled`，那样会把一大批
+既有用例整体弄挂。缺失、`undefined`、抛错，全部视为「开启」。
+
+## V3.5 接口变更
+
+| 方法 | path | v3 变更 |
+|---|---|---|
+| GET | `api/dsh-supermemory/bootstrap` | `data` 顶层新增 **`enabled: boolean`**，与 `data.digestSettings.enabled` 恒等 |
+| — | — | `data.digestSettings` 从 `{digestProvider,digestModel}` 扩为 **`{enabled,digestProvider,digestModel}`** |
+| PUT | `api/dsh-supermemory/settings` | body 可带 `enabled` 布尔并落盘；只带 `enabled` 也算合法请求；非布尔 → 400 `BAD_INPUT`；响应 `{ ok:true, data:{ enabled, digestSettings } }` |
+| POST | `api/dsh-supermemory/digest` | 关闭 → **409 `{ ok:false, code:'PLUGIN_DISABLED' }`**（拦截点在 method 校验之后、读 body 之前） |
+
+`digestProvider` / `digestModel` 的既有校验与行为**完全不变**（仍是「非字符串 → 400」，
+空串表示「跟随当前会话」，三者全缺 → 400）。
+
+`enabled` 对外呈现时**只取运行时权威判定**（`pluginEnabled()`），不回显客户端传来的值：
+存储层没真正落地这一位时，响应必须回带 `true`，否则界面会出现「显示已关闭、其实还在
+注入」的错觉——这是本次改动最不允许出现的状态。
+
+## V3.6 客户端（`lib/client.js`、`locale/*.json`）
+
+- **设置页**顶部新增总开关卡片：`sm-card` + 新增 `sm-switch` 滑块（`role="switch"` +
+  `aria-checked`，只用 §9 白名单 token），当前状态用 `common.on` / `common.off` 显示，
+  点击调 `PUT settings { enabled }`。
+- **乐观更新 + 失败回滚**：点击即翻转界面 → 发请求 → 失败立即回滚到原值并显示
+  `settings.enableFailed`；成功以服务端回带的布尔为准；服务端没回带布尔时再读一次
+  `bootstrap` 确认，确认不到就退回原值并报 `settings.enableUnknown`。
+- **面板**顶部：关闭态挂一条 `sm-notice sm-notice-warn`（`panel.disabledNotice`），
+  并把「立即整理」按钮 `disabled`（`title` 用 `panel.digest.disabledHint`）；
+  `runDigest` 内再挡一层，避免按钮刚失效时的竞态请求。
+- 新增词典键（en/zh 与 `lib/client.js` 内嵌词典三方逐键一致，共 9 个）：
+  `panel.disabledNotice`、`panel.digest.disabledHint`、`settings.enable`、
+  `settings.enableRow`、`settings.enableHint`、`settings.enableAria`、`settings.enableBusy`、
+  `settings.enableFailed`、`settings.enableUnknown`。
+
+## V3.7 测试要求
+
+`test/routes.test.js` 新增覆盖：bootstrap 回带 `enabled`（含 false）、`isEnabled` 缺失/抛错
+视为开启、`PUT settings` 写 `enabled` 生效且不影响既有两键、`enabled` 非布尔 → 400 且
+不落盘、存储层没落地时回带真实状态、关闭时 `POST digest` 409 `PLUGIN_DISABLED` 且
+`runDigest` 未被调用、关闭时 `doc` 读写仍 200、关闭时其余 GET/PUT 一律不 403/404。
+
+**基线**：v2 的 263 个既有用例一个都不许挂；因 `digestSettings` 扩了 `enabled` 而必须同步
+更新的既有断言，只允许改 `test/routes.test.js` 内的期望值。

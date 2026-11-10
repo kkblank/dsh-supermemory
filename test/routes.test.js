@@ -207,14 +207,15 @@ function makePersonasFake(initial = [{ slug: 'default', name: '默认', createdA
 
 /**
  * 内存版设置 API：模拟 store 的 readSettings / writeSettings。
- * @param {{digestProvider?:string, digestModel?:string}} [initial] - 初始设置。
+ * @param {{enabled?:boolean, digestProvider?:string, digestModel?:string}} [initial] - 初始设置。
  * @returns {{api:object, state:object}} 夹具。
  */
 function makeSettingsFake(initial = {}) {
-  const state = { digestProvider: '', digestModel: '', ...initial }
+  const state = { enabled: true, digestProvider: '', digestModel: '', ...initial }
   const api = {
     read: () => ({ ...state }),
     write: async (patch) => {
+      if (typeof patch?.enabled === 'boolean') state.enabled = patch.enabled
       if (typeof patch?.digestProvider === 'string') state.digestProvider = patch.digestProvider
       if (typeof patch?.digestModel === 'string') state.digestModel = patch.digestModel
       return { ok: true, settings: { ...state } }
@@ -402,7 +403,10 @@ describe('GET bootstrap（v2 结构）', () => {
     assert.equal(typeof data.config.digestPressureRatio, 'number')
     assert.equal(data.config.projectDirName, '.dsh/memory')
     assert.equal(data.config.projectFileName, 'project-memory.md')
-    assert.deepEqual(data.digestSettings, { digestProvider: 'prov-a', digestModel: 'model-1' })
+    assert.deepEqual(data.digestSettings, { enabled: true, digestProvider: 'prov-a', digestModel: 'model-1' })
+    // v3：顶层 enabled；mock deps 没提供 isEnabled，缺失一律视为开启。
+    assert.equal(data.enabled, true)
+    assert.equal(data.digestSettings.enabled, true)
     assert.equal(data.presetsRoot, personasRoot)
     assert.equal(data.dshHome, workDir)
     assert.equal('presets' in data, false, 'v2 不应再输出 presets 字段')
@@ -519,8 +523,8 @@ describe('PUT settings', () => {
       mockReq({ method: 'PUT', headers: TRUSTED_HEADERS, body: JSON.stringify({ digestProvider: 'prov-a', digestModel: 'model-1' }) }),
     )
     assert.equal(result.status, 200, result.raw)
-    assert.deepEqual(result.json?.data.digestSettings, { digestProvider: 'prov-a', digestModel: 'model-1' })
-    assert.deepEqual(settings.state, { digestProvider: 'prov-a', digestModel: 'model-1' })
+    assert.deepEqual(result.json?.data.digestSettings, { enabled: true, digestProvider: 'prov-a', digestModel: 'model-1' })
+    assert.deepEqual(settings.state, { enabled: true, digestProvider: 'prov-a', digestModel: 'model-1' })
   })
 
   it('空串表示「跟随当前会话」，可清空设置', async () => {
@@ -533,8 +537,8 @@ describe('PUT settings', () => {
       mockReq({ method: 'PUT', headers: TRUSTED_HEADERS, body: JSON.stringify({ digestProvider: '', digestModel: '' }) }),
     )
     assert.equal(result.status, 200)
-    assert.deepEqual(result.json?.data.digestSettings, { digestProvider: '', digestModel: '' })
-    assert.deepEqual(settings.state, { digestProvider: '', digestModel: '' })
+    assert.deepEqual(result.json?.data.digestSettings, { enabled: true, digestProvider: '', digestModel: '' })
+    assert.deepEqual(settings.state, { enabled: true, digestProvider: '', digestModel: '' })
   })
 
   it('缺少两个字段 / 类型非法 → 400', async () => {
@@ -567,6 +571,235 @@ describe('PUT settings', () => {
     installRoutes(ctx, makeDeps())
     const result = await call(routes, ROUTE_PATHS.settings, mockReq({ headers: TRUSTED_HEADERS }))
     assert.equal(result.status, 405)
+  })
+})
+
+// ---------------------------------------------------------------- 插件总开关（v3）
+
+describe('插件总开关 enabled（v3）', () => {
+  /** 关闭态 deps：isEnabled 明确返回 false。 */
+  function disabledDeps(overrides = {}) {
+    return makeDeps({ isEnabled: () => false, ...overrides })
+  }
+
+  it('bootstrap 顶层回带 enabled=false，digestSettings 也带 enabled', async () => {
+    const settings = makeSettingsFake({ digestProvider: 'prov-a', digestModel: 'model-1' })
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, disabledDeps({ settings: settings.api }))
+    const result = await call(routes, ROUTE_PATHS.bootstrap, mockReq({ headers: TRUSTED_HEADERS }))
+    assert.equal(result.status, 200, result.raw)
+    assert.equal(result.json?.data.enabled, false)
+    assert.deepEqual(result.json?.data.digestSettings, {
+      enabled: false,
+      digestProvider: 'prov-a',
+      digestModel: 'model-1',
+    })
+  })
+
+  it('deps 未提供 isEnabled 时视为开启；抛错时也视为开启', async () => {
+    const { ctx, routes } = makeCtx()
+    installRoutes(
+      ctx,
+      makeDeps({
+        isEnabled: () => {
+          throw new Error('settings.json unreadable')
+        },
+      }),
+    )
+    const result = await call(routes, ROUTE_PATHS.bootstrap, mockReq({ headers: TRUSTED_HEADERS }))
+    assert.equal(result.status, 200, result.raw)
+    assert.equal(result.json?.data.enabled, true)
+    assert.equal(result.json?.data.digestSettings.enabled, true)
+  })
+
+  it('PUT settings 写 enabled 生效并回带，不影响 digestProvider / digestModel', async () => {
+    const settings = makeSettingsFake({ digestProvider: 'prov-a', digestModel: 'model-1' })
+    const { ctx, routes } = makeCtx()
+    // 与 lib/index.js 的真实装配一致：isEnabled 就是读存储层这一位。
+    installRoutes(
+      ctx,
+      makeDeps({ settings: settings.api, isEnabled: () => settings.state.enabled !== false }),
+    )
+    const result = await call(
+      routes,
+      ROUTE_PATHS.settings,
+      mockReq({ method: 'PUT', headers: TRUSTED_HEADERS, body: JSON.stringify({ enabled: false }) }),
+    )
+    assert.equal(result.status, 200, result.raw)
+    assert.equal(result.json?.data.enabled, false)
+    assert.equal(result.json?.data.digestSettings.enabled, false)
+    assert.equal(settings.state.enabled, false)
+    // 既有两键必须原样保留
+    assert.equal(settings.state.digestProvider, 'prov-a')
+    assert.equal(settings.state.digestModel, 'model-1')
+    assert.equal(result.json?.data.digestSettings.digestProvider, 'prov-a')
+    assert.equal(result.json?.data.digestSettings.digestModel, 'model-1')
+
+    const reEnabled = await call(
+      routes,
+      ROUTE_PATHS.settings,
+      mockReq({ method: 'PUT', headers: TRUSTED_HEADERS, body: JSON.stringify({ enabled: true }) }),
+    )
+    assert.equal(reEnabled.status, 200, reEnabled.raw)
+    assert.equal(reEnabled.json?.data.enabled, true)
+    assert.equal(settings.state.enabled, true)
+  })
+
+  it('PUT settings 可同时写 enabled 与模型两键', async () => {
+    const settings = makeSettingsFake()
+    const { ctx, routes } = makeCtx()
+    installRoutes(
+      ctx,
+      makeDeps({ settings: settings.api, isEnabled: () => settings.state.enabled !== false }),
+    )
+    const result = await call(
+      routes,
+      ROUTE_PATHS.settings,
+      mockReq({
+        method: 'PUT',
+        headers: TRUSTED_HEADERS,
+        body: JSON.stringify({ enabled: false, digestProvider: 'prov-b', digestModel: 'model-2' }),
+      }),
+    )
+    assert.equal(result.status, 200, result.raw)
+    assert.deepEqual(settings.state, { enabled: false, digestProvider: 'prov-b', digestModel: 'model-2' })
+    assert.deepEqual(result.json?.data.digestSettings, { enabled: false, digestProvider: 'prov-b', digestModel: 'model-2' })
+  })
+
+  it('PUT settings 的 enabled 非布尔 → 400 且不改动存储', async () => {
+    const settings = makeSettingsFake()
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, makeDeps({ settings: settings.api }))
+    for (const bad of ['false', 0, 1, 'true', null, { value: false }]) {
+      const result = await call(
+        routes,
+        ROUTE_PATHS.settings,
+        mockReq({ method: 'PUT', headers: TRUSTED_HEADERS, body: JSON.stringify({ enabled: bad }) }),
+      )
+      assert.equal(result.status, 400, `enabled=${JSON.stringify(bad)} 必须 400`)
+      assert.equal(result.json?.code, 'BAD_INPUT')
+    }
+    assert.equal(settings.state.enabled, true, '非法值不得落盘')
+    assert.deepEqual(settings.state, { enabled: true, digestProvider: '', digestModel: '' })
+  })
+
+  it('存储层没落地 enabled 时，响应回带真实状态而不是客户端传的值', async () => {
+    // 模拟尚未支持 enabled 的旧 store：write 忽略该键，read 恒为 true，
+    // 装配层的 isEnabled 因此也恒为 true——此时绝不能假装关闭。
+    const state = { enabled: true, digestProvider: '', digestModel: '' }
+    const api = {
+      read: () => ({ ...state }),
+      write: async (patch) => {
+        if (typeof patch?.digestProvider === 'string') state.digestProvider = patch.digestProvider
+        if (typeof patch?.digestModel === 'string') state.digestModel = patch.digestModel
+        return { ok: true, settings: { ...state } }
+      },
+    }
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, makeDeps({ settings: api, isEnabled: () => state.enabled !== false }))
+    const result = await call(
+      routes,
+      ROUTE_PATHS.settings,
+      mockReq({ method: 'PUT', headers: TRUSTED_HEADERS, body: JSON.stringify({ enabled: false }) }),
+    )
+    assert.equal(result.status, 200, result.raw)
+    assert.equal(result.json?.data.enabled, true, '没写进去就不能假装关闭')
+  })
+
+  it('关闭时 POST digest → 409 PLUGIN_DISABLED，且不调用 runDigest', async () => {
+    let called = 0
+    const { ctx, routes } = makeCtx()
+    installRoutes(
+      ctx,
+      disabledDeps({
+        runDigest: async () => {
+          called += 1
+          return { at: new Date().toISOString(), ok: true }
+        },
+      }),
+    )
+    const result = await call(
+      routes,
+      ROUTE_PATHS.digest,
+      mockReq({ method: 'POST', headers: TRUSTED_HEADERS, body: JSON.stringify({ persona: 'default', projectRoot: workDir }) }),
+    )
+    assert.equal(result.status, 409, result.raw)
+    assert.equal(result.json?.ok, false)
+    assert.equal(result.json?.code, 'PLUGIN_DISABLED')
+    assert.equal(called, 0)
+  })
+
+  it('关闭时信任栅栏仍然优先：非 loopback 的 digest 仍是 403 而不是 409', async () => {
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, disabledDeps())
+    const result = await call(
+      routes,
+      ROUTE_PATHS.digest,
+      mockReq({ method: 'POST', headers: TRUSTED_HEADERS, remoteAddress: '10.1.2.3', body: '{}' }),
+    )
+    assert.equal(result.status, 403)
+  })
+
+  it('关闭时 doc 读写仍返回 200（面板还能改记忆内容）', async () => {
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, disabledDeps())
+    const read = await call(
+      routes,
+      ROUTE_PATHS.doc,
+      mockReq({
+        headers: TRUSTED_HEADERS,
+        url: `/api/dsh-supermemory/doc?scope=global&persona=${encodeURIComponent('t:off')}`,
+      }),
+    )
+    assert.equal(read.status, 200, read.raw)
+    assert.equal(typeof read.json?.data.content, 'string')
+
+    const write = await call(
+      routes,
+      ROUTE_PATHS.doc,
+      mockReq({
+        method: 'PUT',
+        headers: TRUSTED_HEADERS,
+        body: JSON.stringify({ scope: 'global', persona: 't:off', content: '# 全局长期记忆\n\n## 条目\n\n- 关闭态写入\n' }),
+      }),
+    )
+    assert.equal(write.status, 200, write.raw)
+
+    const again = await call(
+      routes,
+      ROUTE_PATHS.doc,
+      mockReq({
+        headers: TRUSTED_HEADERS,
+        url: `/api/dsh-supermemory/doc?scope=global&persona=${encodeURIComponent('t:off')}`,
+      }),
+    )
+    assert.equal(again.status, 200)
+    assert.match(again.json?.data.content, /关闭态写入/u)
+  })
+
+  it('关闭时其余 GET/PUT 一律不被拒：面板必须永远进得去', async () => {
+    const settings = makeSettingsFake()
+    const personas = makePersonasFake()
+    const { ctx, routes } = makeCtx()
+    installRoutes(ctx, disabledDeps({ settings: settings.api, personas: personas.api }))
+    const checks = [
+      [ROUTE_PATHS.bootstrap, mockReq({ headers: TRUSTED_HEADERS })],
+      [ROUTE_PATHS.runs, mockReq({ headers: TRUSTED_HEADERS })],
+      [ROUTE_PATHS.models, mockReq({ headers: TRUSTED_HEADERS })],
+      [ROUTE_PATHS.personas, mockReq({ headers: TRUSTED_HEADERS })],
+      [
+        ROUTE_PATHS.personas,
+        mockReq({ method: 'PUT', headers: TRUSTED_HEADERS, body: JSON.stringify({ slug: 'default' }) }),
+      ],
+      [
+        ROUTE_PATHS.settings,
+        mockReq({ method: 'PUT', headers: TRUSTED_HEADERS, body: JSON.stringify({ digestProvider: '', digestModel: '' }) }),
+      ],
+    ]
+    for (const [path, req] of checks) {
+      const result = await call(routes, path, req)
+      assert.equal(result.status, 200, `${path} (${req.method}) 关闭态也必须 200，实际 ${result.status} ${result.raw}`)
+    }
   })
 })
 

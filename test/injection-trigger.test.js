@@ -5,6 +5,8 @@
  *   A) `digestEveryTurns` 计数触发 —— 第 N 轮恰好触发一次，且真的写回文件（PLAN 成功标准 6）。
  *   B) `tokenMeter.contextPressure` 达阈值触发 `pressure` 整理。
  *   C) 快照注入 append / 内容不变不写 / 内容变化 replace / 清空后占位替换。
+ *   D) 插件总开关 `deps.isEnabled` 关闭时：自动整理不触发（手动 runDigest 仍可用）、
+ *      pre-step 不再更新快照且旧快照原样保留。
  *
  * 全部用假 ctx + 真实 store / createDigestRunner / installInjection，不装依赖。
  * 运行：node --test test/injection-trigger.test.js
@@ -96,6 +98,7 @@ function makeCtx(services = {}) {
  * @param {object} [options.config] - 覆盖配置。
  * @param {{pressureTokens:number,contextWindow:number}} [options.pressure] - 假 tokenMeter 返回值。
  * @param {string} [options.llmText] - 假 LLM 输出文本。
+ * @param {() => boolean} [options.isEnabled] - 假插件总开关（缺失视为「开启」）。
  * @returns {Promise<object>} 夹具。
  */
 async function makeDigestHarness(options = {}) {
@@ -138,6 +141,7 @@ async function makeDigestHarness(options = {}) {
     resolveScope: async () => scope,
     currentRoute: () => ({ provider: 'fake-provider', model: 'fake-model' }),
     isSubagent: (agent) => agent?.isSubagent === true,
+    isEnabled: options.isEnabled,
     logger: ctx.logger,
   }
   const runner = createDigestRunner(ctx, deps)
@@ -432,6 +436,7 @@ function makeSession(id) {
  * 建注入夹具（真实 store + 真实 installInjection）。
  * @param {object} [options]
  * @param {object} [options.config] - 覆盖配置。
+ * @param {() => boolean} [options.isEnabled] - 假插件总开关（缺失视为「开启」）。
  * @returns {Promise<object>} 夹具。
  */
 async function makeInjectionHarness(options = {}) {
@@ -455,6 +460,7 @@ async function makeInjectionHarness(options = {}) {
     getConfig: () => resolveConfig(rawConfig),
     loadScope: async () => scope,
     isSubagent: () => false,
+    isEnabled: options.isEnabled,
     logger: ctx.logger,
   }
   const dispose = installInjection(ctx, deps)
@@ -582,4 +588,93 @@ test('四段全空：旧快照被替换成 digest=empty 的占位，surface 仍 
   await h.runPreStep()
   assert.equal(h.session.allPluginEvents().length, logLength)
   assert.equal(h.session.pluginSnapshots().length, 1)
+})
+
+// ——————————————————————————————————————————————
+// D) 插件总开关 deps.isEnabled
+// ——————————————————————————————————————————————
+
+test('总开关关闭：轮数与压力都不触发自动整理，也不产生任何运行记录', async (t) => {
+  let enabled = false
+  const byTurns = await makeDigestHarness({ config: { digestEveryTurns: 1 }, isEnabled: () => enabled })
+  t.after(byTurns.cleanup)
+  for (let index = 0; index < 3; index += 1) await byTurns.emitTurn()
+  await delay(200)
+  assert.equal(byTurns.streamCalls(), 0, '关闭时轮数达到阈值也不得整理')
+  assert.deepEqual(await byTurns.store.readRuns(20), [], '关闭时不得产生运行记录')
+
+  const byPressure = await makeDigestHarness({
+    config: { digestEveryTurns: 0, digestPressureRatio: 0.75 },
+    pressure: { pressureTokens: 90000, contextWindow: 100000 },
+    isEnabled: () => enabled,
+  })
+  t.after(byPressure.cleanup)
+  await byPressure.emitTurn()
+  await byPressure.emitTurn()
+  await delay(200)
+  assert.equal(byPressure.streamCalls(), 0, '关闭时压力越阈也不得整理')
+  assert.deepEqual(await byPressure.store.readRuns(20), [])
+
+  // 重新开启后轮数触发恢复：证明拦住行为的是开关本身。
+  enabled = true
+  await byTurns.emitTurn()
+  const runs = await byTurns.waitForRuns(1)
+  assert.equal(runs.length, 1, '重新开启后必须恢复自动整理')
+  assert.equal(runs[0].trigger, 'turns')
+})
+
+test('总开关只在 maybeTrigger 拦：手动 runDigest 仍可正常跑（手动由 routes 层负责拦）', async (t) => {
+  const h = await makeDigestHarness({ config: { digestEveryTurns: 1 }, isEnabled: () => false })
+  t.after(h.cleanup)
+
+  await h.emitTurn()
+  await delay(150)
+  assert.equal(h.streamCalls(), 0, '自动触发必须被拦住')
+  assert.deepEqual(await h.store.readRuns(20), [])
+
+  const agent = h.ctx.services.agents.get('sess-main')
+  const record = await h.runner.runDigest({ agent, trigger: 'manual' })
+  assert.equal(record.ok, true, JSON.stringify(record))
+  assert.equal(record.trigger, 'manual')
+  assert.equal(h.streamCalls(), 1, '本层不得拦手动整理')
+  const runs = await h.store.readRuns(20)
+  assert.equal(runs.length, 1)
+  assert.equal(runs[0].trigger, 'manual')
+})
+
+test('总开关关闭：pre-step 不再更新快照，已有快照原样保留（不替换、不写占位）', async (t) => {
+  let enabled = true
+  const h = await makeInjectionHarness({ isEnabled: () => enabled })
+  t.after(h.cleanup)
+  await h.seed('global', '旧事实')
+  await h.runPreStep()
+  const before = h.session.pluginSnapshots()[0]
+  assert.ok(before.data.content[0].text.includes('旧事实'))
+  const logLength = h.session.allPluginEvents().length
+
+  // 关闭后即使记忆内容变化，pre-step 也必须一动不动（开启时这里一定会 replace）。
+  enabled = false
+  await h.seed('global', '新事实', '2026-11-10T01:00:00.000Z')
+  const decision = await h.runPreStep()
+  assert.equal(decision.kind, 'enter', '必须原样返回 decision')
+  assert.equal(h.session.allPluginEvents().length, logLength, '关闭时不得新增任何事件')
+  assert.equal(h.session.pluginSnapshots()[0], before, '旧快照必须原样保留')
+  assert.equal(h.session.pluginSnapshots()[0].data.content[0].text.includes('新事实'), false)
+
+  // 记忆被清空也不写「记忆已清空」占位：关闭状态下不做替换也不做清理。
+  for (const kind of ['soul', 'user', 'global', 'project']) {
+    const doc = await h.store.readDoc(h.refs[kind])
+    const written = await h.store.writeDoc(h.refs[kind], '', { expectedMtimeMs: doc.mtimeMs })
+    assert.equal(written.ok, true)
+  }
+  await h.runPreStep()
+  assert.equal(h.session.allPluginEvents().length, logLength, '关闭时不得写占位快照')
+  assert.equal(h.session.pluginSnapshots()[0], before)
+
+  // 重新开启后恢复更新。
+  enabled = true
+  await h.runPreStep()
+  assert.equal(h.session.pluginSnapshots().length, 1)
+  assert.notEqual(h.session.pluginSnapshots()[0], before)
+  assert.ok(h.session.pluginSnapshots()[0].data.content[0].text.includes(EMPTY_SNAPSHOT_TEXT))
 })

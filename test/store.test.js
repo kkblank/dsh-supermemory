@@ -576,35 +576,36 @@ describe('人设注册表（v2）', () => {
 })
 
 describe('插件设置（v2）', () => {
-  test('默认值：文件不存在 → 空 provider/model', () => {
-    assert.deepEqual(store.readSettings(), { digestProvider: '', digestModel: '' })
+  test('默认值：文件不存在 → enabled 开启 + 空 provider/model', () => {
+    assert.deepEqual(store.readSettings(), { enabled: true, digestProvider: '', digestModel: '' })
   })
 
   test('写入后可读回，并持久化到 settings.json', async () => {
     const written = await store.writeSettings({ digestProvider: 'provider-a', digestModel: 'model-a' })
     assert.equal(written.ok, true)
-    assert.deepEqual(written.settings, { digestProvider: 'provider-a', digestModel: 'model-a' })
-    assert.deepEqual(store.readSettings(), { digestProvider: 'provider-a', digestModel: 'model-a' })
+    assert.deepEqual(written.settings, { enabled: true, digestProvider: 'provider-a', digestModel: 'model-a' })
+    assert.deepEqual(store.readSettings(), { enabled: true, digestProvider: 'provider-a', digestModel: 'model-a' })
 
     const raw = JSON.parse(await readFile(join(dshHome, 'supermemory/settings.json'), 'utf8'))
     assert.equal(raw.version, 1)
+    assert.equal(raw.enabled, true)
     assert.equal(raw.digestProvider, 'provider-a')
     assert.equal(raw.digestModel, 'model-a')
 
     const fresh = makeStore()
     await fresh.ready
-    assert.deepEqual(fresh.readSettings(), { digestProvider: 'provider-a', digestModel: 'model-a' })
+    assert.deepEqual(fresh.readSettings(), { enabled: true, digestProvider: 'provider-a', digestModel: 'model-a' })
     await fresh.dispose()
   })
 
-  test('只接受 digestProvider / digestModel；其它键与非字符串值被忽略', async () => {
+  test('只接受 enabled / digestProvider / digestModel；其它键与类型不符值被忽略', async () => {
     await store.writeSettings({ digestProvider: 'p', digestModel: 'm' })
     const written = await store.writeSettings({ digestProvider: 42, digestModel: ' m2 ', evil: 'x' })
     assert.equal(written.ok, true)
-    assert.deepEqual(written.settings, { digestProvider: 'p', digestModel: 'm2' })
+    assert.deepEqual(written.settings, { enabled: true, digestProvider: 'p', digestModel: 'm2' })
 
     const raw = JSON.parse(await readFile(join(dshHome, 'supermemory/settings.json'), 'utf8'))
-    assert.deepEqual(Object.keys(raw).sort(), ['digestModel', 'digestProvider', 'version'])
+    assert.deepEqual(Object.keys(raw).sort(), ['digestModel', 'digestProvider', 'enabled', 'version'])
     assert.equal(raw.evil, undefined)
   })
 
@@ -613,10 +614,10 @@ describe('插件设置（v2）', () => {
     await writeFile(join(dshHome, 'supermemory/settings.json'), '{not json', 'utf8')
     const fresh = makeStore()
     await fresh.ready
-    assert.deepEqual(fresh.readSettings(), { digestProvider: '', digestModel: '' })
+    assert.deepEqual(fresh.readSettings(), { enabled: true, digestProvider: '', digestModel: '' })
     const written = await fresh.writeSettings({ digestProvider: 'p', digestModel: 'm' })
     assert.equal(written.ok, true)
-    assert.deepEqual(fresh.readSettings(), { digestProvider: 'p', digestModel: 'm' })
+    assert.deepEqual(fresh.readSettings(), { enabled: true, digestProvider: 'p', digestModel: 'm' })
     await fresh.dispose()
   })
 
@@ -626,6 +627,69 @@ describe('插件设置（v2）', () => {
       assert.equal(result.ok, false)
       assert.equal(result.code, 'BAD_INPUT')
     }
+  })
+
+  test('enabled 默认开启：文件不存在时为 true', () => {
+    assert.equal(store.readSettings().enabled, true)
+  })
+
+  test('写 enabled:false → 读回 false 且落盘，重开 store 仍为 false', async () => {
+    const written = await store.writeSettings({ enabled: false })
+    assert.equal(written.ok, true)
+    assert.equal(written.settings.enabled, false)
+    assert.equal(store.readSettings().enabled, false)
+
+    const raw = JSON.parse(await readFile(join(dshHome, 'supermemory/settings.json'), 'utf8'))
+    assert.equal(raw.enabled, false)
+    assert.deepEqual(Object.keys(raw).sort(), ['digestModel', 'digestProvider', 'enabled', 'version'])
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.equal(fresh.readSettings().enabled, false)
+    await fresh.dispose()
+  })
+
+  test('enabled 关掉后可再开回 true 并落盘', async () => {
+    await store.writeSettings({ enabled: false })
+    const written = await store.writeSettings({ enabled: true })
+    assert.equal(written.ok, true)
+    assert.equal(written.settings.enabled, true)
+    assert.equal(store.readSettings().enabled, true)
+    const raw = JSON.parse(await readFile(join(dshHome, 'supermemory/settings.json'), 'utf8'))
+    assert.equal(raw.enabled, true)
+  })
+
+  test('enabled 非布尔值忽略：保持当前值不被关闭', async () => {
+    for (const bad of ['false', 'true', 0, 1, null, undefined, {}, []]) {
+      const written = await store.writeSettings({ enabled: bad })
+      assert.equal(written.ok, true)
+      assert.equal(written.settings.enabled, true, `应忽略非法 enabled: ${String(bad)}`)
+    }
+    assert.equal(store.readSettings().enabled, true)
+    const raw = JSON.parse(await readFile(join(dshHome, 'supermemory/settings.json'), 'utf8'))
+    assert.equal(raw.enabled, true)
+  })
+
+  test('settings.json 坏 JSON → enabled 回退 true，绝不因异常关闭插件', async () => {
+    await mkdir(join(dshHome, 'supermemory'), { recursive: true })
+    await writeFile(join(dshHome, 'supermemory/settings.json'), '{"enabled":false,"digestProvider":"p"', 'utf8')
+    const fresh = makeStore()
+    await fresh.ready
+    assert.deepEqual(fresh.readSettings(), { enabled: true, digestProvider: '', digestModel: '' })
+    await fresh.dispose()
+  })
+
+  test('旧版文件缺 enabled 键 → 默认开启且保留已配置模型', async () => {
+    await mkdir(join(dshHome, 'supermemory'), { recursive: true })
+    await writeFile(
+      join(dshHome, 'supermemory/settings.json'),
+      JSON.stringify({ version: 1, digestProvider: 'p', digestModel: 'm' }),
+      'utf8',
+    )
+    const fresh = makeStore()
+    await fresh.ready
+    assert.deepEqual(fresh.readSettings(), { enabled: true, digestProvider: 'p', digestModel: 'm' })
+    await fresh.dispose()
   })
 })
 
@@ -742,7 +806,7 @@ describe('迁移旧 presets 目录（v2）', () => {
     await assert.doesNotReject(() => bad.ready)
     assert.deepEqual(bad.listPersonas(), [])
     assert.equal(bad.currentPersona(), null)
-    assert.deepEqual(bad.readSettings(), { digestProvider: '', digestModel: '' })
+    assert.deepEqual(bad.readSettings(), { enabled: true, digestProvider: '', digestModel: '' })
     const result = await bad.writeDoc({ kind: 'soul', persona: 'default' }, 'x')
     assert.equal(result.ok, false)
     assert.equal(result.code, 'UNWRITABLE')

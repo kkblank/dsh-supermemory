@@ -4,6 +4,10 @@
  * 用假 ctx（get / on / effect / logger）+ 假 session（append / snapshotEvents /
  * surface）+ 真实 store（临时目录）覆盖契约 §5.1–§5.3 的关键路径。
  *
+ * 另覆盖插件总开关 `deps.isEnabled` 的门控：人格 section、快照注入、memory 工具、
+ * 两条斜杠命令在总开关关闭时全部停止工作；判定缺失（既有用例的 mock 没有 isEnabled）
+ * 一律视为「开启」。
+ *
  * 运行：node --test test/host-install.test.js
  */
 
@@ -1004,4 +1008,143 @@ test('/memory-digest：runDigest 抛错时返回 error', async (t) => {
   const result = await digest.handler({ agent: h.agent, rawInput: '', signal: {} })
   assert.equal(result.kind, 'error')
   assert.ok(result.text.includes('runner exploded'))
+})
+
+// ——————————————————————————————————————————————
+// 插件总开关 deps.isEnabled（缺失一律视为「开启」）
+// ——————————————————————————————————————————————
+
+test('总开关关闭：人格 section 返回空串（活动 scope 已建立的情况下）', async (t) => {
+  const h = await makeHarness()
+  t.after(h.cleanup)
+  await h.store.writeDoc({ kind: 'soul', presetId: 'default' }, '# 人格\n\n你是简洁的中文助手。\n')
+  let enabled = true
+  h.deps.isEnabled = () => enabled
+  t.after(installInjection(h.ctx, h.deps))
+
+  // 开启时先跑一轮建立活动 scope —— 之后返回空串只可能是门控造成的。
+  await runPreStep(h.ctx, h.agent)
+  const section = h.sections[0]
+  assert.ok(section.text({}).includes('简洁的中文助手'), '开启时 section 应有内容')
+
+  enabled = false
+  assert.equal(section.text({}), '', '关闭时人格 section 必须返回空串')
+
+  enabled = true
+  assert.ok(section.text({}).includes('简洁的中文助手'), '重新开启后应恢复输出')
+})
+
+test('总开关关闭：pre-step 不写任何快照，已有快照原样保留', async (t) => {
+  const h = await makeHarness()
+  t.after(h.cleanup)
+  const ref = { kind: 'global', presetId: 'default' }
+  await h.store.appendEntries(
+    ref,
+    [{ time: '2026-11-10T10:00:00.000Z', source: 'user-request', body: '旧事实' }],
+  )
+  let enabled = true
+  h.deps.isEnabled = () => enabled
+  t.after(installInjection(h.ctx, h.deps))
+
+  await runPreStep(h.ctx, h.agent)
+  const before = h.session.pluginSnapshots()[0]
+  const logLength = h.session.allPluginEvents().length
+
+  // 记忆发生变化：开启时这一轮一定会 replace，关闭时必须一动不动。
+  enabled = false
+  await h.store.appendEntries(
+    ref,
+    [{ time: '2026-11-10T11:00:00.000Z', source: 'user-request', body: '新事实' }],
+  )
+  const decision = await runPreStep(h.ctx, h.agent)
+  assert.equal(decision.kind, 'enter', '必须原样返回 decision')
+  assert.equal(h.session.allPluginEvents().length, logLength, '关闭时不得新增任何事件')
+  assert.equal(h.session.pluginSnapshots()[0], before, '旧快照必须原样保留：不替换、不清理')
+  assert.equal(h.session.pluginSnapshots()[0].data.source.digest, before.data.source.digest)
+
+  enabled = true
+  await runPreStep(h.ctx, h.agent)
+  assert.equal(h.session.pluginSnapshots().length, 1)
+  assert.ok(h.session.pluginSnapshots()[0].data.content[0].text.includes('新事实'), '重新开启后恢复更新')
+})
+
+test('总开关关闭：memory 工具所有 action 都回 PLUGIN_DISABLED，不碰存储也不抛异常', async (t) => {
+  const h = await makeHarness()
+  t.after(h.cleanup)
+  let enabled = false
+  h.deps.isEnabled = () => enabled
+  const tool = takeMemoryTool(h)
+  const exec = { agent: h.agent, signal: { aborted: false } }
+
+  const cases = [
+    { action: 'list' },
+    { action: 'read', scope: 'global' },
+    { action: 'search', query: 'anything' },
+    { action: 'append', scope: 'global', content: '关掉也写得进去？' },
+    { action: 'replace', scope: 'soul', content: '# 人格\n\n新人格。', confirmSoul: true },
+    { action: 'digest' },
+    { action: 'drop-table' },
+  ]
+  let last
+  for (const args of cases) {
+    last = await tool.execute(args, exec)
+    assert.equal(last.ok, false, `action ${args.action} 必须返回失败`)
+    assert.equal(last.code, 'PLUGIN_DISABLED')
+    assert.equal(last.action, args.action)
+    assert.equal(last.message, 'dsh-supermemory is disabled. Enable it in Settings → Memory.')
+  }
+
+  const noAction = await tool.execute({}, exec)
+  assert.equal(noAction.code, 'PLUGIN_DISABLED')
+  assert.equal(noAction.action, 'unknown', '缺 action 时仍要回显占位，满足输出 schema 的 required')
+
+  // 宿主按 additionalProperties:false 严格校验输出，返回字段必须都在 schema 白名单内。
+  const allowed = new Set(Object.keys(tool.output.schema.properties))
+  for (const key of Object.keys(noAction)) {
+    assert.ok(allowed.has(key), `output schema 不允许的字段 ${key}`)
+  }
+  for (const required of tool.output.schema.required) {
+    assert.equal(Object.prototype.hasOwnProperty.call(noAction, required), true, `缺少 required 字段 ${required}`)
+  }
+
+  assert.equal(h.digestRequests.length, 0, '关闭时不得触发整理')
+  const globalDoc = await h.store.readDoc({ kind: 'global', presetId: 'default' })
+  assert.equal(globalDoc.content.includes('关掉也写得进去'), false, '关闭时不得写入记忆')
+  const soulDoc = await h.store.readDoc({ kind: 'soul', presetId: 'default' })
+  assert.equal(soulDoc.content.includes('新人格'), false, 'soul 同样不得被写入')
+
+  enabled = true
+  const appended = await tool.execute(
+    { action: 'append', scope: 'global', content: '项目使用 pnpm。', reason: '用户告知' },
+    exec,
+  )
+  assert.equal(appended.ok, true, '重新开启后工具应恢复正常')
+})
+
+test('总开关关闭：/remember 与 /memory-digest 只回提示，不写库、不触发整理', async (t) => {
+  const h = await makeHarness()
+  t.after(h.cleanup)
+  let enabled = false
+  h.deps.isEnabled = () => enabled
+  installCommands(h.ctx, h.deps)
+  const remember = h.commandDefinitions.find((definition) => definition.name === 'remember')
+  const digest = h.commandDefinitions.find((definition) => definition.name === 'memory-digest')
+
+  const remembered = await remember.handler({ agent: h.agent, rawInput: '喜欢深色主题', signal: {} })
+  assert.equal(remembered.kind, 'error')
+  assert.ok(remembered.text.includes('已关闭'), '应回一句启用指引')
+
+  const digested = await digest.handler({ agent: h.agent, rawInput: '', signal: {} })
+  assert.equal(digested.kind, 'error')
+  assert.ok(digested.text.includes('已关闭'))
+
+  assert.equal(h.digestRequests.length, 0, '关闭时不得触发整理')
+  const doc = await h.store.readDoc({ kind: 'global', presetId: 'default' })
+  assert.equal(doc.content.includes('喜欢深色主题'), false, '关闭时不得写入记忆')
+
+  enabled = true
+  const ok = await remember.handler({ agent: h.agent, rawInput: '喜欢深色主题', signal: {} })
+  assert.equal(ok.kind, 'success', '重新开启后命令应恢复')
+  const after = await h.store.readDoc({ kind: 'global', presetId: 'default' })
+  assert.ok(after.content.includes('喜欢深色主题'))
 })
