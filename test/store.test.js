@@ -1,5 +1,6 @@
 /**
- * A1 单测：store 读写、冲突、并发、runs、projects（契约 §10 第二组）。
+ * A1 单测：store 读写、冲突、并发、runs、projects、人设、设置、迁移
+ * （契约 §10 第二组 + §V2.8）。
  *
  * 运行：node --test test/store.test.js
  */
@@ -15,7 +16,8 @@ import { createStore } from '../lib/core/store.js'
 /** 每个用例一个干净的 dshHome，after 里统一清理。 */
 let scratchRoot
 let dshHome
-let presetsRoot
+let personasRoot
+let legacyRoot
 let projectRoot
 let store
 
@@ -34,24 +36,36 @@ beforeEach(async () => {
   // 每次用例用独立子目录，互不干扰。
   const base = await mkdtemp(join(scratchRoot, 'case-'))
   dshHome = join(base, 'dsh')
-  presetsRoot = join(dshHome, 'supermemory', 'presets')
+  personasRoot = join(dshHome, 'supermemory', 'personas')
+  legacyRoot = join(dshHome, 'supermemory', 'presets')
   projectRoot = join(base, 'project')
   await mkdir(projectRoot, { recursive: true })
   warnings = []
-  store = createStore({
+  store = makeStore()
+  await store.ready
+})
+
+/** 用当前用例的 dshHome 造一个 store。 */
+function makeStore(overrides = {}) {
+  return createStore({
     dshHome,
-    presetsRoot,
     config: { projectDirName: '.dsh/memory', projectFileName: 'project-memory.md' },
     logger: { warn: (...args) => warnings.push(args.join(' ')), info: () => {} },
     now: () => 1762758000000,
+    ...overrides,
   })
-})
+}
 
-/** 便捷 ref 构造器。 */
-const soulRef = () => ({ kind: 'soul', presetId: 'default' })
-const userRef = () => ({ kind: 'user', presetId: 'p:1' })
-const globalRef = () => ({ kind: 'global', presetId: 'default' })
+/** 便捷 ref 构造器（v2：persona）。 */
+const soulRef = () => ({ kind: 'soul', persona: 'default' })
+const userRef = () => ({ kind: 'user', persona: 'p:1' })
+const globalRef = () => ({ kind: 'global', persona: 'default' })
 const projectRef = () => ({ kind: 'project', projectRoot })
+
+/** 读 personas.json。 */
+async function readRegistry() {
+  return JSON.parse(await readFile(join(dshHome, 'supermemory/personas.json'), 'utf8'))
+}
 
 describe('文档读取', () => {
   test('首次读不存在的文件 → 空模板，且不落盘', async () => {
@@ -62,21 +76,9 @@ describe('文档读取', () => {
     assert.equal(doc.bytes, Buffer.byteLength(doc.content, 'utf8'))
 
     // 目录与文件都不应被创建。
-    let exists = true
-    try {
-      await stat(doc.path)
-    } catch (error) {
-      assert.equal(error.code, 'ENOENT')
-      exists = false
+    for (const target of [doc.path, personasRoot, legacyRoot]) {
+      await assert.rejects(stat(target), (error) => error.code === 'ENOENT')
     }
-    assert.equal(exists, false)
-    let dirExists = true
-    try {
-      await stat(presetsRoot)
-    } catch {
-      dirExists = false
-    }
-    assert.equal(dirExists, false)
   })
 
   test('readDocSync 未缓存 → 空模板，不抛错', () => {
@@ -115,9 +117,44 @@ describe('文档读取', () => {
 
   test('path 参数不可用任意路径读取', async () => {
     const doc = await store.readDoc({ kind: 'project', projectRoot })
-    // 只允许项目目录下的固定文件。
     assert.ok(doc.path.startsWith(projectRoot + '/'))
     assert.ok(doc.path.endsWith('project-memory.md'))
+  })
+
+  test('soul/user/global 文件名固定：soul.md / user.md / global-memory.md', async () => {
+    assert.equal(store.docPath(soulRef()), join(personasRoot, 'default/soul.md'))
+    assert.equal(store.docPath(userRef()), join(personasRoot, 'p-1/user.md'))
+    assert.equal(store.docPath(globalRef()), join(personasRoot, 'default/global-memory.md'))
+
+    await store.writeDoc(globalRef(), '# 全局长期记忆\n\nx\n')
+    assert.equal(await readFile(join(personasRoot, 'default/global-memory.md'), 'utf8'), '# 全局长期记忆\n\nx\n')
+  })
+})
+
+describe('ref：persona 与 presetId 过渡兼容', () => {
+  test('只有 presetId 时当作 persona', () => {
+    assert.equal(store.docPath({ kind: 'soul', presetId: 'default' }), join(personasRoot, 'default/soul.md'))
+    assert.equal(store.docPath({ kind: 'global', presetId: 'p:1' }), join(personasRoot, 'p-1/global-memory.md'))
+  })
+
+  test('persona 与 presetId 同时存在时 persona 优先', () => {
+    assert.equal(store.docPath({ kind: 'soul', persona: 'A', presetId: 'B' }), join(personasRoot, 'A/soul.md'))
+  })
+
+  test('persona 非法字符被 slug 化，不会穿越目录', () => {
+    const target = store.docPath({ kind: 'user', persona: '../../etc' })
+    assert.ok(target.startsWith(personasRoot))
+    assert.equal(target, join(personasRoot, '..-..-etc/user.md'))
+  })
+
+  test('缺省 persona/presetId → default', () => {
+    assert.equal(store.docPath({ kind: 'soul' }), join(personasRoot, 'default/soul.md'))
+  })
+
+  test('persona ref 与 presetId ref 写到同一文件', async () => {
+    await store.writeDoc({ kind: 'global', persona: 'shared' }, 'v1\n')
+    const read = await store.readDoc({ kind: 'global', presetId: 'shared' })
+    assert.equal(read.content, 'v1\n')
   })
 })
 
@@ -191,15 +228,10 @@ describe('写入与冲突', () => {
   })
 
   test('不可写路径 → UNWRITABLE，且不抛', async () => {
-    // 让 presetsRoot 指向一个普通文件，mkdir 必然失败。
+    // 让人设根目录指向一个普通文件下的子路径，mkdir 必然失败。
     const blocker = join(scratchRoot, `blocker-${Date.now()}`)
     await writeFile(blocker, 'not a directory', 'utf8')
-    const broken = createStore({
-      dshHome,
-      presetsRoot: join(blocker, 'presets'),
-      config: {},
-      logger: { warn: () => {}, info: () => {} },
-    })
+    const broken = makeStore({ personasRoot: join(blocker, 'personas') })
     const result = await broken.writeDoc(soulRef(), 'x')
     assert.equal(result.ok, false)
     assert.equal(result.code, 'UNWRITABLE')
@@ -210,9 +242,9 @@ describe('写入与冲突', () => {
   test('写入使用原子替换：不留下临时文件', async () => {
     const first = await store.writeDoc(globalRef(), 'atomic\n')
     assert.equal(first.ok, true)
-    const dir = join(presetsRoot, 'default')
+    const dir = join(personasRoot, 'default')
     const names = await readdir(dir)
-    assert.deepEqual(names, ['global.md'])
+    assert.deepEqual(names, ['global-memory.md'])
   })
 
   test('写入后磁盘内容与返回值一致', async () => {
@@ -242,8 +274,8 @@ describe('并发写', () => {
     assert.equal(read.bytes, Buffer.byteLength(read.content, 'utf8'))
 
     // 目录里不应残留 temp 文件。
-    const names = await readdir(join(presetsRoot, 'default'))
-    assert.deepEqual(names.sort(), ['global.md'])
+    const names = await readdir(join(personasRoot, 'default'))
+    assert.deepEqual(names.sort(), ['global-memory.md'])
   })
 
   test('并发 appendEntries 不丢条目', async () => {
@@ -338,14 +370,8 @@ describe('stats / docPath', () => {
 
   test('docPath 不读盘', () => {
     const target = store.docPath(soulRef())
-    assert.equal(target, join(presetsRoot, 'default/soul.md'))
+    assert.equal(target, join(personasRoot, 'default/soul.md'))
     assert.throws(() => store.docPath({ kind: 'bad' }), (error) => error.code === 'BAD_INPUT')
-  })
-
-  test('presetId 中的非法字符不会穿越目录', () => {
-    const target = store.docPath({ kind: 'user', presetId: '../../etc' })
-    assert.ok(target.startsWith(presetsRoot))
-    assert.equal(target, join(presetsRoot, '..-..-etc/user.md'))
   })
 })
 
@@ -358,18 +384,12 @@ describe('projects.json', () => {
     assert.equal(projects[0].name, 'one')
     assert.equal(projects[0].path, '/repo/one')
 
-    let firstSeen = projects[0].lastSeenAt
+    const firstSeen = projects[0].lastSeenAt
     assert.ok(firstSeen.length > 0)
 
     // 同一路径再次 touch：不新增，更新 lastSeenAt（这里用递增时钟）。
     const later = new Date(Date.parse(firstSeen) + 60_000).toISOString()
-    const store2 = createStore({
-      dshHome,
-      presetsRoot,
-      config: {},
-      logger: { warn: () => {}, info: () => {} },
-      now: () => Date.parse(later),
-    })
+    const store2 = makeStore({ now: () => Date.parse(later) })
     await store2.touchProject('/repo/one', 'renamed')
     await store2.dispose()
 
@@ -415,35 +435,332 @@ describe('projects.json', () => {
   })
 })
 
-describe('presets', () => {
-  test('listPresets 空目录 → []', async () => {
-    assert.deepEqual(await store.listPresets(), [])
+describe('人设注册表（v2）', () => {
+  test('全新 store：listPersonas 为空、currentPersona 为 null、不创建 personas.json', async () => {
+    assert.deepEqual(store.listPersonas(), [])
+    assert.equal(store.currentPersona(), null)
+    await assert.rejects(stat(join(dshHome, 'supermemory/personas.json')), (error) => error.code === 'ENOENT')
   })
 
-  test('ensurePreset 建目录与 preset.json，listPresets 可见', async () => {
+  test('createPersona 建目录并写入 personas.json 结构', async () => {
+    const result = await store.createPersona('Work')
+    assert.equal(result.ok, true)
+    assert.equal(result.persona.slug, 'Work')
+    assert.equal(result.persona.name, 'Work')
+    assert.match(result.persona.createdAt, /^\d{4}-\d{2}-\d{2}T/)
+    assert.equal(result.persona.dir, join(personasRoot, 'Work'))
+    assert.equal((await stat(join(personasRoot, 'Work'))).isDirectory(), true)
+
+    const registry = await readRegistry()
+    assert.equal(registry.version, 1)
+    assert.equal(typeof registry.current, 'string')
+    assert.deepEqual(registry.personas.map((item) => item.slug), ['Work'])
+    assert.equal(registry.personas[0].name, 'Work')
+
+    const listed = store.listPersonas()
+    assert.equal(listed.length, 1)
+    assert.deepEqual(listed[0], {
+      slug: 'Work',
+      name: 'Work',
+      createdAt: result.persona.createdAt,
+      dir: join(personasRoot, 'Work'),
+    })
+  })
+
+  test('createPersona 去空白、截断到 60 字符', async () => {
+    const longName = `  ${'a'.repeat(80)}  `
+    const result = await store.createPersona(longName)
+    assert.equal(result.ok, true)
+    assert.equal(result.persona.name.length, 60)
+    assert.equal(result.persona.name, 'a'.repeat(60))
+  })
+
+  test('createPersona 名称非法 → BAD_INPUT', async () => {
+    for (const bad of ['', '   ', null, undefined, 42]) {
+      const result = await store.createPersona(bad)
+      assert.equal(result.ok, false)
+      assert.equal(result.code, 'BAD_INPUT')
+    }
+  })
+
+  test('slug 冲突追加 -2 / -3', async () => {
+    const first = await store.createPersona('Work')
+    const second = await store.createPersona('Work')
+    const third = await store.createPersona('Work')
+    assert.equal(first.persona.slug, 'Work')
+    assert.equal(second.persona.slug, 'Work-2')
+    assert.equal(third.persona.slug, 'Work-3')
+    assert.equal(store.listPersonas().length, 3)
+  })
+
+  test('listPersonas 按 createdAt 升序', async () => {
+    await store.createPersona('Alpha')
+    await store.createPersona('Beta')
+    const registryPath = join(dshHome, 'supermemory/personas.json')
+    const raw = JSON.parse(await readFile(registryPath, 'utf8'))
+    const alpha = raw.personas.find((item) => item.slug === 'Alpha')
+    const beta = raw.personas.find((item) => item.slug === 'Beta')
+    alpha.createdAt = '2026-11-10T02:00:00.000Z'
+    beta.createdAt = '2026-11-10T01:00:00.000Z'
+    await writeFile(registryPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8')
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.deepEqual(fresh.listPersonas().map((item) => item.slug), ['Beta', 'Alpha'])
+    await fresh.dispose()
+  })
+
+  test('setCurrentPersona 切换并持久化', async () => {
+    await store.createPersona('Work')
+    const switched = await store.setCurrentPersona('Work')
+    assert.equal(switched.ok, true)
+    assert.equal(switched.persona.slug, 'Work')
+    assert.deepEqual(store.currentPersona(), { slug: 'Work', name: 'Work' })
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.deepEqual(fresh.currentPersona(), { slug: 'Work', name: 'Work' })
+    await fresh.dispose()
+  })
+
+  test('setCurrentPersona 参数非法 → BAD_INPUT；未知人设 → NOT_FOUND；default 总可切', async () => {
+    const missing = await store.setCurrentPersona('nope')
+    assert.equal(missing.ok, false)
+    assert.equal(missing.code, 'NOT_FOUND')
+
+    for (const bad of ['', '  ', null, 42]) {
+      const result = await store.setCurrentPersona(bad)
+      assert.equal(result.ok, false)
+      assert.equal(result.code, 'BAD_INPUT')
+    }
+
+    const fallback = await store.setCurrentPersona('default')
+    assert.equal(fallback.ok, true)
+    assert.equal(fallback.persona.slug, 'default')
+  })
+
+  test('personaDir 纯计算且 slug 化', () => {
+    assert.equal(store.personaDir('Work'), join(personasRoot, 'Work'))
+    assert.equal(store.personaDir('a/b'), join(personasRoot, 'a-b'))
+    assert.equal(store.personaDir(), join(personasRoot, 'default'))
+  })
+
+  test('磁盘上已存在但未登记的人设目录会被发现并登记', async () => {
+    await mkdir(join(personasRoot, 'manual'), { recursive: true })
+    const fresh = makeStore()
+    await fresh.ready
+    assert.ok(fresh.listPersonas().some((item) => item.slug === 'manual'))
+    const registry = await readRegistry()
+    assert.ok(registry.personas.some((item) => item.slug === 'manual'))
+    assert.equal(registry.current, 'manual')
+    await fresh.dispose()
+  })
+
+  test('旧 API：listPresets / ensurePreset 兼容', async () => {
+    assert.deepEqual(await store.listPresets(), [])
     const preset = await store.ensurePreset('my:preset')
     assert.equal(preset.slug, 'my-preset')
     assert.equal(preset.id, 'my:preset')
-    assert.equal(preset.dir, join(presetsRoot, 'my-preset'))
+    assert.equal(preset.dir, join(personasRoot, 'my-preset'))
 
-    const meta = JSON.parse(await readFile(join(preset.dir, 'preset.json'), 'utf8'))
-    assert.equal(meta.id, 'my:preset')
-    assert.equal(meta.slug, 'my-preset')
+    const listed = await store.listPresets()
+    assert.equal(listed.length, 1)
+    assert.equal(listed[0].slug, 'my-preset')
+    assert.equal(listed[0].id, 'my-preset')
+    assert.ok(listed[0].updatedAt.length > 0)
 
-    const presets = await store.listPresets()
-    assert.equal(presets.length, 1)
-    assert.equal(presets[0].slug, 'my-preset')
-    assert.equal(presets[0].id, 'my:preset')
-    assert.ok(presets[0].updatedAt.length > 0)
+    // 幂等：重复 ensurePreset 不产生重复登记。
+    await store.ensurePreset('my:preset')
+    assert.equal(store.listPersonas().length, 1)
+  })
+})
+
+describe('插件设置（v2）', () => {
+  test('默认值：文件不存在 → 空 provider/model', () => {
+    assert.deepEqual(store.readSettings(), { digestProvider: '', digestModel: '' })
   })
 
-  test('ensurePreset 幂等（已存在时不重复写）', async () => {
-    const first = await store.ensurePreset('default')
-    const rawFirst = await readFile(join(first.dir, 'preset.json'), 'utf8')
-    const second = await store.ensurePreset('default')
-    assert.equal(second.dir, first.dir)
-    const rawSecond = await readFile(join(second.dir, 'preset.json'), 'utf8')
-    assert.equal(rawSecond, rawFirst)
+  test('写入后可读回，并持久化到 settings.json', async () => {
+    const written = await store.writeSettings({ digestProvider: 'provider-a', digestModel: 'model-a' })
+    assert.equal(written.ok, true)
+    assert.deepEqual(written.settings, { digestProvider: 'provider-a', digestModel: 'model-a' })
+    assert.deepEqual(store.readSettings(), { digestProvider: 'provider-a', digestModel: 'model-a' })
+
+    const raw = JSON.parse(await readFile(join(dshHome, 'supermemory/settings.json'), 'utf8'))
+    assert.equal(raw.version, 1)
+    assert.equal(raw.digestProvider, 'provider-a')
+    assert.equal(raw.digestModel, 'model-a')
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.deepEqual(fresh.readSettings(), { digestProvider: 'provider-a', digestModel: 'model-a' })
+    await fresh.dispose()
+  })
+
+  test('只接受 digestProvider / digestModel；其它键与非字符串值被忽略', async () => {
+    await store.writeSettings({ digestProvider: 'p', digestModel: 'm' })
+    const written = await store.writeSettings({ digestProvider: 42, digestModel: ' m2 ', evil: 'x' })
+    assert.equal(written.ok, true)
+    assert.deepEqual(written.settings, { digestProvider: 'p', digestModel: 'm2' })
+
+    const raw = JSON.parse(await readFile(join(dshHome, 'supermemory/settings.json'), 'utf8'))
+    assert.deepEqual(Object.keys(raw).sort(), ['digestModel', 'digestProvider', 'version'])
+    assert.equal(raw.evil, undefined)
+  })
+
+  test('坏 JSON 不炸：读回默认值，仍可写入覆盖', async () => {
+    await mkdir(join(dshHome, 'supermemory'), { recursive: true })
+    await writeFile(join(dshHome, 'supermemory/settings.json'), '{not json', 'utf8')
+    const fresh = makeStore()
+    await fresh.ready
+    assert.deepEqual(fresh.readSettings(), { digestProvider: '', digestModel: '' })
+    const written = await fresh.writeSettings({ digestProvider: 'p', digestModel: 'm' })
+    assert.equal(written.ok, true)
+    assert.deepEqual(fresh.readSettings(), { digestProvider: 'p', digestModel: 'm' })
+    await fresh.dispose()
+  })
+
+  test('patch 非对象 → BAD_INPUT', async () => {
+    for (const bad of [null, 'x', 42, ['a']]) {
+      const result = await store.writeSettings(bad)
+      assert.equal(result.ok, false)
+      assert.equal(result.code, 'BAD_INPUT')
+    }
+  })
+})
+
+describe('迁移旧 presets 目录（v2）', () => {
+  /** 造旧 v1 的 presets 目录。 */
+  async function buildLegacy() {
+    await mkdir(join(legacyRoot, 'alpha'), { recursive: true })
+    await mkdir(join(legacyRoot, 'zeta'), { recursive: true })
+    await writeFile(join(legacyRoot, 'alpha/soul.md'), '# 人格 (soul)\n\n旧人格 alpha\n', 'utf8')
+    await writeFile(
+      join(legacyRoot, 'alpha/preset.json'),
+      JSON.stringify({ version: 1, id: 'alpha', name: 'Alpha Persona', createdAt: '2026-01-01T00:00:00.000Z' }),
+      'utf8',
+    )
+    await writeFile(join(legacyRoot, 'zeta/user.md'), '# 用户画像 (user)\n\n旧画像 zeta\n', 'utf8')
+  }
+
+  test('createStore → await ready 后整体搬到 personas/ 并登记', async () => {
+    await buildLegacy()
+    const fresh = makeStore()
+    await fresh.ready
+
+    // 1) personas 目录出现，内容完整保留。
+    assert.equal(await readFile(join(personasRoot, 'alpha/soul.md'), 'utf8'), '# 人格 (soul)\n\n旧人格 alpha\n')
+    assert.equal(await readFile(join(personasRoot, 'zeta/user.md'), 'utf8'), '# 用户画像 (user)\n\n旧画像 zeta\n')
+
+    // 2) 旧目录不残留。
+    await assert.rejects(stat(legacyRoot), (error) => error.code === 'ENOENT')
+
+    // 3) personas.json 正确：current 取第一个迁移到的 slug。
+    const registry = await readRegistry()
+    assert.equal(registry.version, 1)
+    assert.equal(registry.current, 'alpha')
+    assert.deepEqual(registry.personas.map((item) => item.slug).sort(), ['alpha', 'zeta'])
+    assert.equal(registry.personas.find((item) => item.slug === 'alpha').name, 'Alpha Persona')
+    assert.equal(registry.personas.find((item) => item.slug === 'alpha').createdAt, '2026-01-01T00:00:00.000Z')
+
+    // 4) 迁移后文档可读。
+    assert.ok((await fresh.readDoc({ kind: 'soul', persona: 'alpha' })).content.includes('旧人格 alpha'))
+    assert.ok((await fresh.readDoc({ kind: 'user', persona: 'zeta' })).content.includes('旧画像 zeta'))
+    assert.deepEqual(fresh.currentPersona(), { slug: 'alpha', name: 'Alpha Persona' })
+    assert.deepEqual(
+      fresh.listPersonas().map((item) => item.slug).sort(),
+      ['alpha', 'zeta'],
+    )
+
+    // 5) migrateLegacyPresets 返回本次迁移结果，且重复调用幂等。
+    assert.deepEqual(await fresh.migrateLegacyPresets(), { migrated: ['alpha', 'zeta'] })
+    assert.deepEqual(await fresh.migrateLegacyPresets(), { migrated: ['alpha', 'zeta'] })
+    await fresh.dispose()
+  })
+
+  test('幂等：再次 createStore 不会重复登记', async () => {
+    await buildLegacy()
+    const first = makeStore()
+    await first.ready
+    await first.dispose()
+
+    const second = makeStore()
+    await second.ready
+    assert.equal(second.listPersonas().length, 2)
+    assert.deepEqual(await second.migrateLegacyPresets(), { migrated: [] })
+    const registry = await readRegistry()
+    assert.equal(registry.personas.length, 2)
+    await second.dispose()
+  })
+
+  test('personas/ 已存在时只搬走还没搬的，不动已有目录', async () => {
+    await mkdir(join(personasRoot, 'keep'), { recursive: true })
+    await writeFile(join(personasRoot, 'keep/soul.md'), '# 人格 (soul)\n\n已有 keep\n', 'utf8')
+    await mkdir(join(legacyRoot, 'old'), { recursive: true })
+
+    const fresh = makeStore()
+    await fresh.ready
+    assert.equal(await readFile(join(personasRoot, 'keep/soul.md'), 'utf8'), '# 人格 (soul)\n\n已有 keep\n')
+    assert.equal((await stat(join(personasRoot, 'old'))).isDirectory(), true)
+    await assert.rejects(stat(legacyRoot), (error) => error.code === 'ENOENT')
+
+    const registry = await readRegistry()
+    assert.equal(registry.current, 'old')
+    assert.deepEqual(registry.personas.map((item) => item.slug).sort(), ['keep', 'old'])
+    await fresh.dispose()
+  })
+
+  test('旧 presets 为空目录：仍创建 personas.json，current 为 default', async () => {
+    await mkdir(legacyRoot, { recursive: true })
+    const fresh = makeStore()
+    await fresh.ready
+    await assert.rejects(stat(legacyRoot), (error) => error.code === 'ENOENT')
+    const registry = await readRegistry()
+    assert.equal(registry.current, 'default')
+    assert.deepEqual(registry.personas, [])
+    await fresh.dispose()
+  })
+
+  test('显式把 personasRoot 指向旧 presets 路径时直接沿用，不搬迁', async () => {
+    await mkdir(join(legacyRoot, 'adopted'), { recursive: true })
+    await writeFile(join(legacyRoot, 'adopted/global-memory.md'), '# 全局长期记忆\n\n沿用\n', 'utf8')
+
+    const fresh = makeStore({ personasRoot: legacyRoot })
+    await fresh.ready
+    assert.equal((await stat(join(legacyRoot, 'adopted'))).isDirectory(), true)
+    assert.ok(fresh.listPersonas().some((item) => item.slug === 'adopted'))
+    assert.ok((await fresh.readDoc({ kind: 'global', persona: 'adopted' })).content.includes('沿用'))
+    const registry = JSON.parse(await readFile(join(dshHome, 'supermemory/personas.json'), 'utf8'))
+    assert.equal(registry.current, 'adopted')
+    await fresh.dispose()
+  })
+
+  test('ready 永不 reject：dshHome 不可用时也不抛，写入返回 UNWRITABLE', async () => {
+    const badHome = join(scratchRoot, `bad-home-${Date.now()}`)
+    await writeFile(badHome, 'not a directory', 'utf8')
+    const bad = createStore({ dshHome: badHome, config: {}, logger: { warn: () => {} } })
+    await assert.doesNotReject(() => bad.ready)
+    assert.deepEqual(bad.listPersonas(), [])
+    assert.equal(bad.currentPersona(), null)
+    assert.deepEqual(bad.readSettings(), { digestProvider: '', digestModel: '' })
+    const result = await bad.writeDoc({ kind: 'soul', persona: 'default' }, 'x')
+    assert.equal(result.ok, false)
+    assert.equal(result.code, 'UNWRITABLE')
+    await bad.dispose()
+  })
+
+  test('坏 personas.json 不炸：按空注册表处理并可重建', async () => {
+    await mkdir(join(dshHome, 'supermemory'), { recursive: true })
+    await writeFile(join(dshHome, 'supermemory/personas.json'), '{not json', 'utf8')
+    const fresh = makeStore()
+    await fresh.ready
+    assert.deepEqual(fresh.listPersonas(), [])
+    assert.equal(fresh.currentPersona(), null)
+    const created = await fresh.createPersona('Fresh')
+    assert.equal(created.ok, true)
+    const registry = await readRegistry()
+    assert.deepEqual(registry.personas.map((item) => item.slug), ['Fresh'])
+    await fresh.dispose()
   })
 })
 

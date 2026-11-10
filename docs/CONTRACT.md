@@ -724,3 +724,226 @@ ctx.slots.inject('settings.section', () => ctx.slots.register(
 - 非 loopback socket / 带 `x-forwarded-for` / `cross-site` / 异源 origin → 403。
 - 正常 loopback → 200。
 - 路径穿越参数 → 400 而非读到任意文件。
+
+---
+
+# v2 变更（优先于前文，冲突时以本节为准）
+
+用户提出的 5 条产品变更，属破坏性改动。本节**覆盖**前文的 `preset` 概念。
+
+## V2.0 五条变更与决策
+
+| # | 需求 | 决策 |
+|---|---|---|
+| 1 | 人格设定不参与记忆整理 | 整理器**永不写 soul**。soul 只能用户手动编辑，或用户提示词明确要求时 agent 经 `memory` 工具写 |
+| 2 | 用户画像/全局记忆不可频繁自动修改 | **自动整理只写 project**。user/global 永不自动写；只能用户手动编辑或明确要求时 agent 通过 `memory` 写 |
+| 3 | 自动整理可自选模型 | 新增模型选择器，数据源 `llm.listProviders()` + `llm.listModels(provider)`；选择存 `settings.json` |
+| 4 | 项目不用手动添加，自动同步工作区 | 项目列表来自 `ctx.get('workspaceRegistry').list()`，面板只读；删除「添加项目」 |
+| 5 | 新增「人设」层，独立 soul/user/global，项目记忆不跟人设 | **人设（persona）取代 agent preset 作为记忆隔离单位**；全局单一「当前人设」，面板切换 |
+
+## V2.1 数据模型（替代 §3.1、§4 的 presets 部分）
+
+```
+$DSH_HOME/supermemory/
+  personas.json                    # { version:1, current:<slug>, personas:[{slug,name,createdAt}] }
+  personas/<slug>/
+    soul.md
+    user.md
+    global-memory.md
+  settings.json                    # { version:1, digestProvider, digestModel }
+  projects.json                    # 保留：仅记录 lastSeenAt，不再作为项目列表来源
+  runs.jsonl
+```
+
+```
+<projectRoot>/.dsh/memory/project-memory.md     # 不变
+```
+
+- `slug`：`personaSlug(name)` = 非 `[A-Za-z0-9._-]` 替换为 `-`；空/`default` 保留；`..`/`.` → `default`。
+- **迁移**：`createStore` 首次被调用时，若 `personas/` 不存在而旧 `presets/` 存在，
+  把 `presets/<slug>/` 整体搬到 `personas/<slug>/` 并登记；`personas.json` 不存在则创建，
+  `current` 取迁移到的第一个 slug，否则 `'default'`。迁移失败只告警，不阻断。
+- `settings.json` 不存在 → 返回默认 `{ digestProvider:'', digestModel:'' }`。
+- **迁移时机**：`createStore()` 返回对象上带一个 `ready: Promise<void>`，构造时立即启动迁移
+  （`migrateLegacyPresets()` 的 Promise）。**所有异步方法内部先 `await ready`**，
+  这样调用方不需要关心迁移。`ready` 永不 reject（失败只告警）。
+
+## V2.2 存储层新增 API（A1 负责，`lib/core/store.js`）
+
+以下**新增**，其余（readDoc/writeDoc/appendEntries/readRuns/appendRun/docPath/stats/dispose）不变：
+
+```js
+// —— 人设 ——
+listPersonas() -> Array<{ slug, name, createdAt, dir }>          // 按 createdAt 升序
+currentPersona() -> { slug, name } | null                        // 读 personas.json.current
+setCurrentPersona(slug) -> Promise<{ ok:true, persona } | { ok:false, code, message }>
+createPersona(name) -> Promise<{ ok:true, persona } | { ok:false, code, message }>
+  // slug 冲突 → 追加 -2、-3；name 去空白、截 60 字符；createdAt = ISO
+personaDir(slug) -> string                                        // 纯计算，不读盘
+migrateLegacyPresets() -> Promise<{ migrated: string[] }>         // 幂等
+```
+
+**ref 形态变更**：`soul`/`user`/`global` 的隔离键从 `presetId` 改为 `persona`：
+
+```js
+{ kind: 'soul'   | 'user' | 'global', persona: slug }
+{ kind: 'project', projectRoot }                                  // 不变
+```
+
+**过渡兼容**：若 ref 只有 `presetId` 没有 `persona`，按 `presetId` 当作 persona 处理
+（现有测试大量使用 `presetId`，这样可平滑迁移）。两者都给时 `persona` 优先。
+
+```js
+// —— 插件设置 ——
+readSettings() -> { digestProvider: string, digestModel: string }
+writeSettings(patch) -> Promise<{ ok:true, settings } | { ok:false, code, message }>
+  // 只接受 digestProvider / digestModel 两个字符串；其它键忽略
+```
+
+配置字段：`presetsRoot` 改名 `personasRoot`（默认空 → `$DSH_HOME/supermemory/personas`）。
+`resolvePresetsRoot(resolved, dshHome)` 保留导出名但按 `personasRoot` 解析，`presetsRoot` 作为废弃别名仍接受。
+
+## V2.3 整理器（C 负责，`lib/host/digest.js`）
+
+**输出与写入范围收窄**：
+
+- `DIGEST_SYSTEM_PROMPT` 改为只要求输出 `{"project":["..."]}`，并明确：
+  「不要输出 soul/user/global；人格与画像/全局记忆由用户手动维护。」
+- 解析后**只写 project**。`soul`/`user`/`global` 无论模型输出什么都不写。
+  用配置 `digestWritableScopes`（默认 `['project']`）表达，便于将来扩展，但默认只 project。
+- `RunRecord.counts` 仍保留四个 key，非 project 恒为 0。
+
+**模型选择优先级**（改 `resolveRoute`）：
+
+1. `store.readSettings().digestProvider` + `.digestModel`（面板里选的）
+2. `getConfig().digestProvider` + `.digestModel`（cordis.patch.yml）
+3. `deps.currentRoute(agent)`（当前会话路由）
+4. `agentDefaultModel.currentSelection()`
+
+任一层 provider 与 model 必须同时非空才采用。
+
+## V2.4 路由（C 负责，`lib/host/routes.js`）
+
+新增/变更：
+
+| 方法 | path | 说明 |
+|---|---|---|
+| GET | `api/dsh-supermemory/bootstrap` | **结构变更**，见下 |
+| GET | `api/dsh-supermemory/doc` | query 参数 `persona`（兼容 `presetId`）+ `projectRoot` |
+| PUT | `api/dsh-supermemory/doc` | body：`persona`（兼容 `presetId`） |
+| POST | `api/dsh-supermemory/digest` | body：`persona`、`projectRoot` |
+| GET | `api/dsh-supermemory/runs` | 不变 |
+| **GET** | **`api/dsh-supermemory/models`** | 新增：可用模型列表 |
+| **PUT** | **`api/dsh-supermemory/settings`** | 新增：保存整理模型 |
+| **GET** | **`api/dsh-supermemory/personas`** | 新增：人设列表 + current |
+| **POST** | **`api/dsh-supermemory/personas`** | 新增：`{name}` 创建人设，自动切换为 current |
+| **PUT** | **`api/dsh-supermemory/personas`** | 新增：`{slug}` 切换 current |
+
+**`bootstrap` 新结构**：
+
+```js
+{
+  ok: true,
+  data: {
+    personas: [{ slug, name, createdAt }],
+    currentPersona: { slug, name } | null,
+    projects: [{ path, name }],          // 来自 workspaceRegistry.list()
+    active: { persona, projectRoot, projectName } | null,   // 当前会话解析结果
+    config: { systemPromptMaxBytes, injectMaxBytes, autoDigest, digestEveryTurns,
+              digestPressureRatio, digestWritableScopes, projectDirName, projectFileName },
+    digestSettings: { digestProvider, digestModel },
+    presetsRoot: personasRoot,
+    dshHome
+  }
+}
+```
+
+**`models` 响应**：
+
+```js
+{ ok:true, data:{ models:[{ provider, id, name, label }], current:{ provider, model } | null } }
+```
+
+由 `deps.listModels()` 提供（`lib/index.js` 实现：遍历 `llm.listProviders()` 再 `llm.listModels(p.id)`，
+单个 provider 抛错则跳过；`label` = `providerName / modelName`）。
+`current` 读 `store.readSettings()`，空则 null。
+
+**`personas` 响应**：`{ ok:true, data:{ personas, current } }`。
+创建/切换成功后返回同样的 `data`。名称非法（空、超 60）→ 400。
+
+**项目列表**：不再接受客户端传任意项目路径作为「添加项目」。
+`projects` 必须来自 `deps.listProjects()`（`lib/index.js` 用 `workspaceRegistry.list()` 实现）。
+
+## V2.5 注入层（B 负责，`lib/host/tools.js`、`commands.js`；`inject.js` 仅小改）
+
+`inject.js` 无需改逻辑：scope 由 `lib/index.js` 的 `resolveScope` 提供，
+现在返回的 `presetId` 字段改名为 `persona`（同时保留 `presetId` 兼容字段一段时间）。
+
+**`memory` 工具的写保护**（重要）：
+
+| scope | append | replace | 允许条件 |
+|---|---|---|---|
+| `soul` | ❌ 拒绝 | ✅ 允许 | 必须带 `confirmSoul: true` 参数，且拒绝时返回 `code:'SOUL_CONFIRM_REQUIRED'` 并说明「人格只能用户手动改，或用户明确要求时带 confirmSoul 写入」 |
+| `user` | ✅ | ✅ | 允许，但工具描述要求只在用户明确陈述偏好/事实时写 |
+| `global` | ✅ | ✅ | 同上 |
+| `project` | ✅ | ✅ | 无额外限制 |
+
+参数新增：
+
+```js
+confirmSoul: { type: 'boolean', description: 'Set true only when the user explicitly asked to change the persona/soul. Required for any soul write.' }
+```
+
+输出 schema 加 `confirmSoul` 不需要，但错误要能区分（`code`）。
+
+**命令**：`/remember` 默认写 `global` 不变；新增 `/remember soul ...` 需带 `--confirm`，
+否则返回 error 提示人格只能用户手动改。
+
+## V2.6 客户端（D 负责，`lib/client.js`、`locale/*.json`）
+
+**顶部工具栏改为**（顺序固定）：
+
+```
+[人设 ▾]  [+ 添加人设]  [项目 ▾]        …右侧：预算占用条
+```
+
+- **人设下拉**：来自 `bootstrap.personas`，选中即 `PUT personas {slug}` 切换全局 current，
+  然后重新加载四个分区。
+- **「+ 添加人设」按钮**：点开内联输入框（用 `prompt` 是禁止的，要自绘 input），
+  输入名称 → `POST personas {name}` → 成功后刷新列表并切换到新人设。
+- **项目下拉**：来自 `bootstrap.projects`（工作区自动同步），**只读**，删除原有「添加项目」按钮与
+  `uiWorkspace.pickDirectory` 逻辑。
+- **整理卡片**增加模型选择：`select` 选项来自 `GET models`，默认为 `digestSettings` 或「跟随当前会话」，
+  变更时 `PUT settings {digestProvider, digestModel}`（选「跟随当前会话」则传空串）。
+
+**分区导航**：soul/user/global 读当前人设；project 读当前项目的记忆。项目区显示根路径。
+
+**locale**：新增 key 至少包括
+`panel.persona`、`panel.personaAdd`、`panel.personaAddPlaceholder`、`panel.personaCreateFailed`、
+`panel.personaSwitched`、`panel.digest.model`、`panel.digest.modelFollow`、
+`panel.projectAuto`；删除 `panel.addProject*`、`panel.noPicker`、`panel.pickFailed`。
+en/zh 两套必须键完全一致。
+
+**约束不变**：只 `require('react')`、无 JSX、只用 `--dsw-alias-*` token、fetch 用 document-relative。
+
+## V2.7 `lib/index.js`（Lead 负责）
+
+- `resolveScope(agent)`：
+  - `persona = store.currentPersona()?.slug ?? 'default'`
+  - `cwd` 解析与 `projectRoot` 逻辑不变
+  - 返回 `{ persona, presetId: persona, projectRoot, projectName, reason }`
+- 新增 `deps.listModels()`、`deps.listProjects()`（workspaceRegistry）、`deps.personasApi` 所需的 store 直通。
+- `deps.currentRoute` 保持不变。
+
+## V2.8 测试要求变更
+
+- `test/paths-document.test.js`：`personaSlug` 用例（原 `presetSlug` 保留别名）。
+- `test/store.test.js`：新增 personas 增删查切、`personas.json` 结构、迁移、settings 读写。
+- `test/render-digest.test.js`：不变（纯函数层）。
+- `test/host-install.test.js`：新增 soul 写保护（无 `confirmSoul` → 拒绝；有则允许）、
+  user/global 无限制、注入 scope 字段变更。
+- `test/routes.test.js`：bootstrap 新结构、models 路由、personas 增改查、doc 路由 `persona` 参数。
+- `test/injection-trigger.test.js`：整理只写 project 的断言（user/global 输出被丢弃）。
+- `test/trust-fence.test.js`：不变。
+
+**验收基线**：全部测试通过；`node --test` 用例数不减少。

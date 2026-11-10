@@ -652,6 +652,54 @@ function takeMemoryTool(h) {
   return h.toolDefinitions[0]
 }
 
+test('memory 工具：soul 写入必须 confirmSoul（人格只属于用户）', async (t) => {
+  const h = await makeHarness()
+  t.after(h.cleanup)
+  const tool = takeMemoryTool(h)
+  const exec = { agent: h.agent, signal: { aborted: false } }
+
+  // append：无 confirmSoul 被拒
+  const deniedAppend = await tool.execute({ action: 'append', scope: 'soul', content: '说话简洁', reason: 'x' }, exec)
+  assert.equal(deniedAppend.ok, false)
+  assert.equal(deniedAppend.code, 'SOUL_CONFIRM_REQUIRED')
+
+  // append：带 confirmSoul 允许
+  const allowedAppend = await tool.execute(
+    { action: 'append', scope: 'soul', content: '说话简洁', reason: '用户要求', confirmSoul: true },
+    exec,
+  )
+  assert.equal(allowedAppend.ok, true)
+
+  // replace：同样受保护
+  const deniedReplace = await tool.execute({ action: 'replace', scope: 'soul', content: '# 人格\n\n新人格。' }, exec)
+  assert.equal(deniedReplace.ok, false)
+  assert.equal(deniedReplace.code, 'SOUL_CONFIRM_REQUIRED')
+
+  const allowedReplace = await tool.execute(
+    { action: 'replace', scope: 'soul', content: '# 人格\n\n新人格。', confirmSoul: true },
+    exec,
+  )
+  assert.equal(allowedReplace.ok, true)
+  assert.ok((await h.store.readDoc({ kind: 'soul', presetId: 'default' })).content.includes('新人格'))
+
+  // user / global / project 不受 confirmSoul 限制
+  for (const scope of ['user', 'global']) {
+    const result = await tool.execute({ action: 'append', scope, content: `${scope} 事实。`, reason: '用户陈述' }, exec)
+    assert.equal(result.ok, true, `${scope} 不应被 soul 保护拦截`)
+  }
+  const projectResult = await tool.execute({ action: 'append', scope: 'project', content: '项目约定。' }, exec)
+  assert.equal(projectResult.ok, true)
+})
+
+test('memory 工具描述：说明 soul/user/global 的写入策略与整理范围', async (t) => {
+  const h = await makeHarness()
+  t.after(h.cleanup)
+  const tool = takeMemoryTool(h)
+  const description = String(tool.description)
+  assert.ok(/soul/i.test(description) && /confirmSoul/i.test(description))
+  assert.ok(/never.*automatic|automatic.*never|only writes project|project memory/i.test(description))
+})
+
 test('memory 工具：定义结构合法（宿主可注册的普通对象）', async (t) => {
   const h = await makeHarness()
   t.after(h.cleanup)
@@ -876,10 +924,16 @@ test('/remember：显式 scope 生效，未知 scope 词当内容', async (t) =>
   installCommands(h.ctx, h.deps)
   const remember = h.commandDefinitions.find((definition) => definition.name === 'remember')
 
-  const soul = await remember.handler({ agent: h.agent, rawInput: 'soul 说话要简洁', signal: {} })
+  // v2：soul 必须显式 --confirm 才写（人格属于用户）。
+  const soulDenied = await remember.handler({ agent: h.agent, rawInput: 'soul 说话要简洁', signal: {} })
+  assert.equal(soulDenied.kind, 'error')
+  assert.ok(soulDenied.text.includes('--confirm'))
+
+  const soul = await remember.handler({ agent: h.agent, rawInput: 'soul --confirm 说话要简洁', signal: {} })
   assert.equal(soul.kind, 'success')
   const soulDoc = await h.store.readDoc({ kind: 'soul', presetId: 'default' })
   assert.ok(soulDoc.content.includes('说话要简洁'))
+  assert.equal(soulDoc.content.includes('--confirm'), false)
 
   const project = await remember.handler({ agent: h.agent, rawInput: 'project 提交前跑测试', signal: {} })
   assert.equal(project.kind, 'success')

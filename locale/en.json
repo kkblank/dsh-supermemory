@@ -2,14 +2,9 @@
   "meta.title": "Memory",
   "meta.description": "Persona, user profile, global memory and project memory, injected into every session and editable from the Web panel.",
   "panel.title": "Memory",
-  "panel.preset": "Preset",
   "panel.project": "Project",
-  "panel.addProject": "Add project",
-  "panel.addProjectDone": "Project added.",
-  "panel.addProjectHint": "Could not register this project path; pick it again from the list.",
   "panel.budget.persona": "Persona",
   "panel.budget.inject": "Injection",
-  "panel.noPreset": "No presets",
   "panel.noProject": "No projects",
   "panel.section.soul": "Persona",
   "panel.section.user": "User profile",
@@ -31,8 +26,6 @@
   "panel.saveFailed": "Could not save the file: {error}",
   "panel.conflict": "This file was modified outside the panel.",
   "panel.conflictHint": "Reload to read the latest disk content; copy your edits first if you want to keep them.",
-  "panel.noPicker": "No directory picker is available in this client.",
-  "panel.pickFailed": "Could not open the directory picker: {error}",
   "panel.digest.title": "Latest digest",
   "panel.digest.none": "No digest has run yet.",
   "panel.digest.now": "Digest now",
@@ -73,5 +66,22 @@
   "settings.row.digestModel": "Digest model",
   "settings.row.injectIntoSubagents": "Inject into subagents",
   "common.on": "On",
-  "common.off": "Off"
+  "common.off": "Off",
+  "panel": {
+    "persona": "Persona",
+    "noPersona": "No personas",
+    "personaAdd": "Add persona",
+    "personaAddPlaceholder": "New persona name",
+    "personaCreate": "Create",
+    "personaCancel": "Cancel",
+    "personaCreateFailed": "Could not create persona: {error}",
+    "personaSwitched": "Persona switched.",
+    "digest": {
+      "model": "Digest model",
+      "modelFollow": "Follow current session",
+      "modelSaved": "Digest model saved.",
+      "modelSaveFailed": "Could not save the digest model: {error}"
+    },
+    "projectAuto": "Synced from your workspace."
+  }
 }

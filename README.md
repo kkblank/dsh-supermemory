@@ -2,9 +2,9 @@
 
 给 DeepSeek Harness 加上「人格 + 用户画像 + 全局长期记忆 + 项目记忆」的持久记忆插件。
 
-每个会话自动带上四段记忆，可在 Web UI 里查看、编辑、手动整理；Agent 也能通过
-`memory` 工具读写检索。人格/画像/全局记忆按 **agent 预设** 隔离，项目记忆按
-**项目根目录** 隔离。
+每个会话自动带上记忆，可在 Web UI 里查看、编辑、手动整理；Agent 也能通过
+`memory` 工具读写检索。人格/画像/全局记忆按 **人设** 隔离，项目记忆按
+**项目根** 隔离。
 
 ---
 
@@ -13,14 +13,27 @@
 | 能力 | 说明 |
 |---|---|
 | 自动注入 | 新建会话时，提示词里自动出现人格、用户画像、全局记忆、项目记忆 |
-| 按预设隔离 | `soul.md` / `user.md` / `global-memory.md` 每个 agent 预设一份 |
+| 按人设隔离 | `soul.md` / `user.md` / `global-memory.md` 每个人设一份 |
 | 按项目隔离 | `<项目根>/.dsh/memory/project-memory.md`，不同项目互不可见 |
 | 单条快照 | 记忆内容变化后下一次请求即生效，历史里始终只有一条最新快照，不随轮次累积 |
-| Web 面板 | 侧栏「记忆」图标 → 独立面板，分区切换、编辑保存、mtime 冲突检测 |
+| Web 面板 | 侧栏「记忆」图标 → 独立面板，切换人设/项目、编辑保存、mtime 冲突检测 |
 | 设置页 | 只读概览：目录、预算占用、触发阈值、最近整理 |
-| 自动整理 | 每 N 轮 / 上下文压力超阈值 / 手动触发，把增量写进对应文件并出报告 |
+| 手动整理 | 每 N 轮 / 上下文压力超阈值 / 手动按钮触发，**只写项目记忆** |
+| 整理模型可选 | 面板里从已配置模型中选择整理用的模型，或跟随当前会话 |
 | `memory` 工具 | Agent 可 list / read / search / append / replace / digest |
 | 预算降级 | 记忆超预算时自动降级为「索引 + 摘要」，不会无限膨胀提示词 |
+
+## 写入策略（v2 起）
+
+| 分区 | 自动整理 | Agent 工具 | 用户手动 |
+|---|---|---|---|
+| 人格 `soul` | ❌ 永不 | 仅当用户明确要求改人设，且带 `confirmSoul: true` | ✅ |
+| 用户画像 `user` | ❌ 永不 | ✅ 但只写用户明确陈述的偏好/事实 | ✅ |
+| 全局记忆 `global` | ❌ 永不 | ✅ 同上 | ✅ |
+| 项目记忆 `project` | ✅ 唯一自动写入的分区 | ✅ | ✅ |
+
+自动整理只在**项目记忆**上工作：它读最近对话，提炼与当前项目相关的新增约定/决策/坑，
+追加写进 `<项目根>/.dsh/memory/project-memory.md`。
 
 ## 安装
 
@@ -37,24 +50,29 @@ plugin_manager({ action: 'install_bundle',
 
 ```
 $DSH_HOME/supermemory/
-  presets/<presetSlug>/
-    preset.json            # { id: 原始 preset id, updatedAt }
-    soul.md                # 人格设定
-    user.md                # 用户画像
-    global-memory.md       # 跨项目长期记忆
-  projects.json            # 已知项目索引 [{ path, root, name, lastSeenAt }]
-  runs.jsonl               # 最近整理报告（最多保留 200 条）
+  personas.json                    # { version, current, personas:[{slug,name,createdAt}] }
+  personas/<slug>/
+    soul.md                        # 人格设定
+    user.md                        # 用户画像
+    global-memory.md               # 跨项目长期记忆
+  settings.json                    # { digestProvider, digestModel }
+  projects.json                    # 仅记录 lastSeenAt，不作为项目列表来源
+  runs.jsonl                       # 最近整理报告（最多保留 200 条）
 ```
 
 ```
 <项目根>/.dsh/memory/
-  project-memory.md        # 该项目专属记忆
+  project-memory.md                # 该项目专属记忆
 ```
 
-- `presetSlug`：preset id 里 `[^a-zA-Z0-9._-]` 替换为 `-`，空则 `default`；
-  原始 id 存在 `preset.json`，注入文件名不影响语义。
+- **人设**：面板下拉里的条目，可新增。每个拥有独立的 soul/user/global。
+  首次安装自动创建 `Default` 人设。
+- `slug`：人设名里保留 Unicode 字母数字（含中文），其它字符折叠为 `-`，
+  上限 48 字符；空/全非法回退 `default`。所以「工作助手」会得到
+  `personas/工作助手/`。
+- **项目列表自动同步宿主工作区**（`workspaceRegistry`），不需要手动添加；
+  有几个工作区项目就有几份项目记忆。
 - 项目根：从会话 cwd 向上找 `.git`，找不到则用 cwd 本身。
-- 文件不存在时按需创建（首次注入或首次写入），不预建所有项目目录。
 
 ## 文件格式
 
@@ -102,7 +120,7 @@ $DSH_HOME/supermemory/
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 总开关（`false` 时不注入、不注册工具与面板） |
-| `presetsRoot` | 空（= `$DSH_HOME/supermemory/presets`） | 记忆根目录 |
+| `personasRoot` | 空（= `$DSH_HOME/supermemory/personas`） | 人设根目录 |
 | `projectDirName` | `.dsh/memory` | 项目内目录 |
 | `projectFileName` | `project-memory.md` | 项目记忆文件名 |
 | `systemPromptMaxBytes` | `12000` | 人格+画像进系统提示的上限 |
@@ -112,8 +130,14 @@ $DSH_HOME/supermemory/
 | `digestPressureRatio` | `0.75` | 上下文压力阈值（0 关闭） |
 | `digestMaxInputBytes` | `120000` | 整理请求输入上限 |
 | `digestMaxOutputTokens` | `3000` | 整理输出上限 |
-| `digestProvider` / `digestModel` | 空 | 空则沿用当前会话路由 |
+| `digestProvider` / `digestModel` | 空 | 默认整理模型；面板里选的值优先 |
+| `digestWritableScopes` | `['project']` | 整理可写的分区（v2 硬限制为 `project`） |
 | `injectIntoSubagents` | `true` | 子智能体是否带记忆 |
+
+> 旧字段名 `presetsRoot` 仍被接受，等价于 `personasRoot`。
+
+**整理模型优先级**：面板选择（`settings.json`）→ 配置里的 `digestProvider/Model`
+→ 当前会话路由 → 宿主默认模型。每层要求 provider 与 model 同时非空。
 
 ## `memory` 工具
 
@@ -124,6 +148,7 @@ $DSH_HOME/supermemory/
 | `query` | `search` 时必填，关键词或简单正则 |
 | `content` | `append` / `replace` 时必填 |
 | `reason` | 写入原因，写进条目元数据 |
+| `confirmSoul` | 写 `soul` 时必须为 `true`；否则返回 `SOUL_CONFIRM_REQUIRED` |
 
 `project` 作用域的项目根由会话 cwd 自动解析，**不接受模型传入任意路径**；
 所有路径穿越都被拒绝。
@@ -131,7 +156,8 @@ $DSH_HOME/supermemory/
 ## 斜杠命令
 
 - `/remember [scope] <内容>` —— 等价 `memory append`，默认 `global`
-- `/memory-digest` —— 立即整理一次
+- `/remember soul --confirm <内容>` —— 改动人格需要 `--confirm`
+- `/memory-digest` —— 立即整理一次（只写项目记忆）
 
 ## 停用
 
@@ -149,26 +175,27 @@ $DSH_HOME/supermemory/
 ## 开发
 
 ```bash
-node --test          # 全部单测（190 个用例）
+node --test          # 全部单测（263 个用例）
 ```
 
 `test/` 下按模块分组：
 
 | 文件 | 覆盖 |
 |---|---|
-| `paths-document.test.js` | slug / 项目根 / 安全 join / md 文档格式 / 配置 |
-| `store.test.js` | 原子写、mtime 冲突、并发写、runs.jsonl、projects.json |
+| `paths-document.test.js` | 人设 slug（含中文）、项目根、安全 join、md 文档格式、配置 |
+| `store.test.js` | 原子写、mtime 冲突、并发写、人设注册表、settings、迁移、runs |
 | `render-digest.test.js` | 注入渲染、预算降级、转义、整理解析与合并 |
-| `host-install.test.js` | 注入链路、memory 工具、斜杠命令 |
-| `routes.test.js` | HTTP 路由、STALE 冲突、请求体上限、整理器 |
-| `injection-trigger.test.js` | 自动整理触发（轮数 / 压力 / 负向拦截）+ 快照回归 |
-| `trust-fence.test.js` | 信任栅栏五维矩阵（socket / 代理头 / Host / Origin / Sec-Fetch-Site） |
+| `host-install.test.js` | 注入链路、memory 工具、soul 写保护、斜杠命令 |
+| `routes.test.js` | HTTP 路由、models/settings/personas、STALE 冲突、整理器 |
+| `injection-trigger.test.js` | 自动整理触发（轮数 / 压力 / 负向拦截）+ 只写 project |
+| `trust-fence.test.js` | 信任栅栏五维矩阵 |
 
 本地跑测试需要 `@deepseek-ai/schemastery`（唯一宿主依赖，仅 `lib/host/config.js` 使用）。
 工作区的 `node_modules/@deepseek-ai/` 是开发时的副本，已由 `.gitignore` 排除；
 插件安装到 profile 后从 profile 的 `node_modules` 解析，不依赖这份副本。
 
-`docs/CONTRACT.md` 是模块契约，`docs/WORKER.md` 是协作须知。
+`docs/CONTRACT.md` 是模块契约（末尾「v2 变更」章节覆盖前文的 preset 概念），
+`docs/WORKER.md` 是协作须知。
 
 ## 浏览器验证说明
 

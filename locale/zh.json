@@ -2,14 +2,9 @@
   "meta.title": "记忆",
   "meta.description": "人格、用户画像、全局记忆与项目记忆：注入每个会话，并可在 Web 面板中直接编辑。",
   "panel.title": "记忆",
-  "panel.preset": "预设",
   "panel.project": "项目",
-  "panel.addProject": "添加项目",
-  "panel.addProjectDone": "项目已添加。",
-  "panel.addProjectHint": "该路径未能登记，请稍后从列表中重新选择。",
   "panel.budget.persona": "人格",
   "panel.budget.inject": "注入",
-  "panel.noPreset": "无预设",
   "panel.noProject": "无项目",
   "panel.section.soul": "人格",
   "panel.section.user": "用户画像",
@@ -31,8 +26,6 @@
   "panel.saveFailed": "保存文件失败：{error}",
   "panel.conflict": "文件已被外部修改。",
   "panel.conflictHint": "请重新载入以获取磁盘上的最新内容；如需保留当前修改，请先复制。",
-  "panel.noPicker": "当前客户端没有可用的目录选择器。",
-  "panel.pickFailed": "无法打开目录选择器：{error}",
   "panel.digest.title": "最近整理",
   "panel.digest.none": "还没有整理记录。",
   "panel.digest.now": "立即整理",
@@ -73,5 +66,22 @@
   "settings.row.digestModel": "整理 model",
   "settings.row.injectIntoSubagents": "注入子智能体",
   "common.on": "开启",
-  "common.off": "关闭"
+  "common.off": "关闭",
+  "panel": {
+    "persona": "人设",
+    "noPersona": "没有人设",
+    "personaAdd": "+ 添加人设",
+    "personaAddPlaceholder": "新人设名称",
+    "personaCreate": "创建",
+    "personaCancel": "取消",
+    "personaCreateFailed": "创建人设失败：{error}",
+    "personaSwitched": "已切换人设。",
+    "digest": {
+      "model": "整理模型",
+      "modelFollow": "跟随当前会话",
+      "modelSaved": "整理模型已保存。",
+      "modelSaveFailed": "保存整理模型失败：{error}"
+    },
+    "projectAuto": "已从工作区自动同步。"
+  }
 }

@@ -10,9 +10,10 @@ import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 
-import { resolveConfig, resolvePresetsRoot } from '../lib/host/config.js'
+import { resolveConfig, resolvePersonasRoot, resolvePresetsRoot } from '../lib/host/config.js'
 import {
   SafeJoinError,
+  personaSlug,
   presetSlug,
   projectDisplayName,
   resolveProjectRoot,
@@ -55,10 +56,10 @@ describe('presetSlug', () => {
     assert.equal(presetSlug(''), 'default')
   })
 
-  test('全非法字符 → default', () => {
+  test('全非法字符 → default（中文现在合法，见 personaSlug）', () => {
     assert.equal(presetSlug('***'), 'default')
-    assert.equal(presetSlug('中文'), 'default')
     assert.equal(presetSlug('/'), 'default')
+    assert.equal(personaSlug('中文'), '中文')
   })
 
   test('非字符串 → default', () => {
@@ -70,6 +71,54 @@ describe('presetSlug', () => {
   test('slug 不会是 . 或 ..', () => {
     assert.equal(presetSlug('.'), 'default')
     assert.equal(presetSlug('..'), 'default')
+  })
+})
+
+describe('personaSlug', () => {
+  test('普通名字原样保留', () => {
+    assert.equal(personaSlug('default'), 'default')
+    assert.equal(personaSlug('My-Persona_2.0'), 'My-Persona_2.0')
+  })
+
+  test('含非法字符 → 逐字符替换为 -', () => {
+    assert.equal(personaSlug('foo/bar'), 'foo-bar')
+    assert.equal(personaSlug('my persona'), 'my-persona')
+    assert.equal(personaSlug('../../etc/passwd'), '..-..-etc-passwd')
+  })
+
+  test('空串 / 全非法字符 / 非字符串 → default', () => {
+    assert.equal(personaSlug(''), 'default')
+    assert.equal(personaSlug('***'), 'default')
+    assert.equal(personaSlug('/'), 'default')
+    assert.equal(personaSlug(undefined), 'default')
+    assert.equal(personaSlug(null), 'default')
+    assert.equal(personaSlug(42), 'default')
+  })
+
+  test('slug 不会是 . 或 ..', () => {
+    assert.equal(personaSlug('.'), 'default')
+    assert.equal(personaSlug('..'), 'default')
+  })
+
+  test('中文名保留为目录名（否则所有人设都会挤到 default）', () => {
+    assert.equal(personaSlug('我的助手'), '我的助手')
+    assert.equal(personaSlug('工作助手'), '工作助手')
+    assert.equal(personaSlug('工作 助手'), '工作-助手')
+    assert.equal(personaSlug('工作:助手'), '工作-助手')
+    assert.notEqual(personaSlug('工作'), personaSlug('生活'))
+  })
+
+  test('slug 有长度上限且不残留首尾连字符', () => {
+    const long = personaSlug('很长的人设名'.repeat(20))
+    assert.ok([...long].length <= 48, `slug 过长: ${long.length}`)
+    assert.ok(!long.startsWith('-') && !long.endsWith('-'))
+  })
+
+  test('presetSlug 是 personaSlug 的别名（同一行为）', () => {
+    for (const input of ['default', 'foo:bar', '', '***', '..', '../../etc/passwd']) {
+      assert.equal(presetSlug(input), personaSlug(input))
+    }
+    assert.equal(presetSlug, personaSlug)
   })
 })
 
@@ -284,6 +333,7 @@ describe('document', () => {
 describe('resolveConfig', () => {
   const defaults = {
     enabled: true,
+    personasRoot: '',
     presetsRoot: '',
     projectDirName: '.dsh/memory',
     projectFileName: 'project-memory.md',
@@ -294,6 +344,7 @@ describe('resolveConfig', () => {
     digestPressureRatio: 0.75,
     digestMaxInputBytes: 120000,
     digestMaxOutputTokens: 3000,
+    digestWritableScopes: ['project'],
     digestProvider: '',
     digestModel: '',
     injectIntoSubagents: true,
@@ -318,7 +369,39 @@ describe('resolveConfig', () => {
   test('enabled:false 保留，其它字段仍规范化', () => {
     const resolved = resolveConfig({ enabled: false, presetsRoot: '/tmp/p' })
     assert.equal(resolved.enabled, false)
+    assert.equal(resolved.personasRoot, '/tmp/p')
+    // v1 字段名作为废弃别名保留，与 personasRoot 同值。
     assert.equal(resolved.presetsRoot, '/tmp/p')
+  })
+
+  test('personasRoot 优先于废弃别名 presetsRoot', () => {
+    const resolved = resolveConfig({ personasRoot: '/new/root', presetsRoot: '/old/root' })
+    assert.equal(resolved.personasRoot, '/new/root')
+    assert.equal(resolved.presetsRoot, '/new/root')
+  })
+
+  test('personasRoot 为空串时回退到 presetsRoot 别名', () => {
+    const resolved = resolveConfig({ personasRoot: '', presetsRoot: '/legacy/root' })
+    assert.equal(resolved.personasRoot, '/legacy/root')
+    assert.equal(resolved.presetsRoot, '/legacy/root')
+  })
+
+  test('digestWritableScopes 默认只 project', () => {
+    assert.deepEqual(resolveConfig({}).digestWritableScopes, ['project'])
+    assert.deepEqual(resolveConfig({ digestWritableScopes: ['project', 'global'] }).digestWritableScopes, [
+      'project',
+      'global',
+    ])
+  })
+
+  test('digestWritableScopes 过滤非法 scope、去重、空/非法回退默认', () => {
+    assert.deepEqual(
+      resolveConfig({ digestWritableScopes: ['project', 'PROJECT', 'nope', 42, ' global '] }).digestWritableScopes,
+      ['project', 'global'],
+    )
+    assert.deepEqual(resolveConfig({ digestWritableScopes: [] }).digestWritableScopes, ['project'])
+    assert.deepEqual(resolveConfig({ digestWritableScopes: 'project' }).digestWritableScopes, ['project'])
+    assert.deepEqual(resolveConfig({ digestWritableScopes: ['bogus'] }).digestWritableScopes, ['project'])
   })
 
   test('非法数值回退默认', () => {
@@ -380,22 +463,39 @@ describe('resolveConfig', () => {
   })
 })
 
-describe('resolvePresetsRoot', () => {
-  test('非空 presetsRoot 直接使用', () => {
+describe('resolvePresetsRoot / resolvePersonasRoot', () => {
+  test('非空 personasRoot 直接使用', () => {
+    assert.equal(resolvePresetsRoot({ personasRoot: '/custom/personas' }, '/dsh'), '/custom/personas')
+    assert.equal(resolvePersonasRoot({ personasRoot: '/custom/personas' }, '/dsh'), '/custom/personas')
+  })
+
+  test('只有废弃别名 presetsRoot → 直接使用', () => {
     assert.equal(resolvePresetsRoot({ presetsRoot: '/custom/presets' }, '/dsh'), '/custom/presets')
   })
 
-  test('空串 → $DSH_HOME/supermemory/presets', () => {
-    assert.equal(resolvePresetsRoot({ presetsRoot: '' }, '/dsh'), join('/dsh', 'supermemory', 'presets'))
-    assert.equal(resolvePresetsRoot({}, '/dsh'), join('/dsh', 'supermemory', 'presets'))
-    assert.equal(resolvePresetsRoot(undefined, '/dsh'), join('/dsh', 'supermemory', 'presets'))
+  test('personasRoot 优先于 presetsRoot', () => {
+    assert.equal(
+      resolvePresetsRoot({ personasRoot: '/new/root', presetsRoot: '/old/root' }, '/dsh'),
+      '/new/root',
+    )
+  })
+
+  test('空串 → $DSH_HOME/supermemory/personas', () => {
+    const expected = join('/dsh', 'supermemory', 'personas')
+    assert.equal(resolvePresetsRoot({ personasRoot: '', presetsRoot: '' }, '/dsh'), expected)
+    assert.equal(resolvePresetsRoot({}, '/dsh'), expected)
+    assert.equal(resolvePresetsRoot(undefined, '/dsh'), expected)
+  })
+
+  test('resolvePersonasRoot 与 resolvePresetsRoot 是同一函数', () => {
+    assert.equal(resolvePersonasRoot, resolvePresetsRoot)
   })
 
   test('dshHome 缺失时回退 DSH_HOME 环境变量', () => {
     const previous = process.env.DSH_HOME
     process.env.DSH_HOME = '/env/dsh'
     try {
-      assert.equal(resolvePresetsRoot({ presetsRoot: '' }), join('/env/dsh', 'supermemory', 'presets'))
+      assert.equal(resolvePresetsRoot({ personasRoot: '' }), join('/env/dsh', 'supermemory', 'personas'))
     } finally {
       if (previous === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previous

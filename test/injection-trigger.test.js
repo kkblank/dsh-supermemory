@@ -21,8 +21,8 @@ import { resolveConfig } from '../lib/host/config.js'
 import { createDigestRunner } from '../lib/host/digest.js'
 import { EMPTY_DIGEST, EMPTY_SNAPSHOT_TEXT, installInjection, SNAPSHOT_NOTICE } from '../lib/host/inject.js'
 
-/** 整理器固定返回的 JSON（global 一条新增事实）。 */
-const DIGEST_JSON = '{"soul":[],"user":[],"global":["自动整理新增的事实"],"project":[]}'
+/** 整理器固定返回的 JSON（v2：只允许 project 一条新增事实）。 */
+const DIGEST_JSON = '{"project":["自动整理新增的事实"]}'
 
 /** 等待若干毫秒。 */
 function delay(ms) {
@@ -100,9 +100,17 @@ function makeCtx(services = {}) {
  */
 async function makeDigestHarness(options = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'sm-trigger-'))
-  const presetsRoot = join(dir, 'presets')
-  const rawConfig = { presetsRoot, digestProvider: 'fake-provider', digestModel: 'fake-model', ...options.config }
-  const store = createStore({ dshHome: dir, presetsRoot, config: resolveConfig(rawConfig), logger: { warn() {} } })
+  // v2：人格/画像/全局记忆落在 personas/ 下；store 可能只认 personasRoot。
+  const presetsRoot = join(dir, 'personas')
+  const rawConfig = { presetsRoot, personasRoot: presetsRoot, digestProvider: 'fake-provider', digestModel: 'fake-model', ...options.config }
+  const store = createStore({
+    dshHome: dir,
+    presetsRoot,
+    personasRoot: presetsRoot,
+    config: resolveConfig(rawConfig),
+    logger: { warn() {} },
+  })
+  if (store?.ready !== undefined) await store.ready
 
   let streamCalls = 0
   const llmText = options.llmText ?? DIGEST_JSON
@@ -123,7 +131,7 @@ async function makeDigestHarness(options = {}) {
   }
 
   const ctx = makeCtx(services)
-  const scope = { presetId: 'default', projectRoot: dir, projectName: 'proj' }
+  const scope = { persona: 'default', presetId: 'default', projectRoot: dir, projectName: 'proj' }
   const deps = {
     store,
     getConfig: () => resolveConfig(rawConfig),
@@ -214,12 +222,12 @@ test('digestEveryTurns=3：前两轮不触发，第 3 轮恰好触发一次 turn
   assert.equal(runs[0].trigger, 'turns')
   assert.equal(runs[0].ok, true)
   assert.equal(runs[0].sessionId, 'sess-main')
-  assert.equal(runs[0].counts.global, 1)
+  assert.deepEqual(runs[0].counts, { soul: 0, user: 0, global: 0, project: 1 })
   assert.equal(h.streamCalls(), 1, '恰好调用一次 LLM')
 
-  // 整理条目必须真的落到文件里。
-  const doc = await h.store.readDoc({ kind: 'global', presetId: 'default' })
-  assert.ok(doc.content.includes('自动整理新增的事实'), '整理结果必须写进 global 文件')
+  // v2：整理条目必须真的落到 project 文件里（soul/user/global 永不自动写）。
+  const doc = await h.store.readDoc({ kind: 'project', projectRoot: h.dir })
+  assert.ok(doc.content.includes('自动整理新增的事实'), '整理结果必须写进 project 文件')
   assert.ok(doc.content.includes('source:digest'), '条目来源必须是 source:digest')
 
   // 新周期的前两轮不触发：证明是每 N 轮而不是每轮。
@@ -228,6 +236,61 @@ test('digestEveryTurns=3：前两轮不触发，第 3 轮恰好触发一次 turn
   await delay(150)
   assert.equal(h.streamCalls(), 1, '新周期前两轮不得再触发')
   assert.equal((await h.store.readRuns(20)).length, 1)
+})
+
+// ——————————————————————————————————————————————
+// A2) v2：整理只写 project
+// ——————————————————————————————————————————————
+
+test('v2 整理只写 project：模型输出的 soul/user/global 条目全部被丢弃', async (t) => {
+  const h = await makeDigestHarness({
+    config: { digestEveryTurns: 1 },
+    llmText: JSON.stringify({
+      soul: ['自动整理不得写人格'],
+      user: ['自动整理不得写画像'],
+      global: ['自动整理不得写全局'],
+      project: ['整理器应该只写这条项目事实'],
+    }),
+  })
+  t.after(h.cleanup)
+
+  await h.emitTurn()
+  const runs = await h.waitForRuns(1)
+  assert.equal(runs.length, 1, '必须产生一条运行记录')
+  assert.equal(runs[0].ok, true, JSON.stringify(runs[0]))
+  assert.deepEqual(runs[0].counts, { soul: 0, user: 0, global: 0, project: 1 }, '非 project 的 counts 必须恒为 0')
+
+  const projectDoc = await h.store.readDoc({ kind: 'project', projectRoot: h.dir })
+  assert.ok(projectDoc.content.includes('整理器应该只写这条项目事实'), 'project 条目必须写入')
+
+  const forbidden = [
+    ['soul', '自动整理不得写人格'],
+    ['user', '自动整理不得写画像'],
+    ['global', '自动整理不得写全局'],
+  ]
+  for (const [kind, marker] of forbidden) {
+    const doc = await h.store.readDoc({ kind, persona: 'default', presetId: 'default' })
+    assert.equal(doc.content.includes(marker), false, `${kind} 不得被自动整理写入`)
+  }
+})
+
+test('v2 整理输出只有 soul/user/global 时：一次空写、不产生任何文件变更', async (t) => {
+  const h = await makeDigestHarness({
+    config: { digestEveryTurns: 1 },
+    llmText: JSON.stringify({ soul: ['人格'], user: ['画像'], global: ['全局'] }),
+  })
+  t.after(h.cleanup)
+
+  await h.emitTurn()
+  const runs = await h.waitForRuns(1)
+  assert.equal(runs.length, 1)
+  assert.equal(runs[0].ok, true)
+  assert.deepEqual(runs[0].counts, { soul: 0, user: 0, global: 0, project: 0 })
+
+  const projectDoc = await h.store.readDoc({ kind: 'project', projectRoot: h.dir })
+  assert.equal(projectDoc.content.includes('人格'), false)
+  assert.equal(projectDoc.content.includes('画像'), false)
+  assert.equal(projectDoc.content.includes('全局'), false)
 })
 
 test('子智能体的 turn/end 不触发自动整理（parentSession 或 isSubagent 两种判定都要拦住）', async (t) => {
@@ -373,11 +436,19 @@ function makeSession(id) {
  */
 async function makeInjectionHarness(options = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'sm-inject-'))
-  const presetsRoot = join(dir, 'presets')
-  const rawConfig = { presetsRoot, ...options.config }
-  const store = createStore({ dshHome: dir, presetsRoot, config: resolveConfig(rawConfig), logger: { warn() {} } })
+  // v2：人格/画像/全局记忆落在 personas/ 下；store 可能只认 personasRoot。
+  const presetsRoot = join(dir, 'personas')
+  const rawConfig = { presetsRoot, personasRoot: presetsRoot, ...options.config }
+  const store = createStore({
+    dshHome: dir,
+    presetsRoot,
+    personasRoot: presetsRoot,
+    config: resolveConfig(rawConfig),
+    logger: { warn() {} },
+  })
+  if (store?.ready !== undefined) await store.ready
   const session = makeSession('sess-inject')
-  const scope = { presetId: 'default', projectRoot: dir, projectName: 'proj' }
+  const scope = { persona: 'default', presetId: 'default', projectRoot: dir, projectName: 'proj' }
   const ctx = makeCtx({})
   const deps = {
     store,
@@ -388,9 +459,9 @@ async function makeInjectionHarness(options = {}) {
   }
   const dispose = installInjection(ctx, deps)
   const refs = {
-    soul: { kind: 'soul', presetId: 'default' },
-    user: { kind: 'user', presetId: 'default' },
-    global: { kind: 'global', presetId: 'default' },
+    soul: { kind: 'soul', persona: 'default', presetId: 'default' },
+    user: { kind: 'user', persona: 'default', presetId: 'default' },
+    global: { kind: 'global', persona: 'default', presetId: 'default' },
     project: { kind: 'project', projectRoot: dir },
   }
   const seed = (kind, body, time = '2026-11-10T00:00:00.000Z') =>

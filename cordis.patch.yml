@@ -9,6 +9,8 @@
       name: dsh-supermemory
       config:
         enabled: true
+        # 人设根目录留空 = $DSH_HOME/supermemory/personas
+        # personasRoot: ''
         systemPromptMaxBytes: 12000
         injectMaxBytes: 24000
         autoDigest: true
