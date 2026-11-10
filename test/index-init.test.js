@@ -45,9 +45,13 @@ const DEFAULT_NAME = 'Default'
  *
  * 精简自 test/host-install.test.js 的 `makeCtx`，刻意**不搬** `makeSession` 那套 surface
  * 强校验：入口只注册 `agent/created` / `agent/pre-step` / `session/event` 三个监听，
- * 宿主服务（session、workspaceRegistry、webServer……）全部只在事件回调里被 `ctx.get`
+ * 宿主服务（session、workspaceRegistry……）全部只在事件回调里被 `ctx.get`
  * 取用，本文件不触发任何事件，所以 `get()` 一律返回 undefined 就够（已实测 apply 不抛、
  * 零告警）。搬 90 行 session 假实现过来纯属死重。
+ *
+ * 唯一的例外是 `webServer`：它写在入口的 `inject` 里，框架能调到 `apply` 就意味着它
+ * 已经就绪，所以假 ctx 必须给一个能注册路由的实现——否则 `installRoutes` 会照常告警，
+ * 「装配全程零告警」那条断言就成了在测试一个不可能的场景。
  *
  * 两份 makeCtx 各自独立、不跨测试文件 import：一个文件挂掉不该连带挂另一个。
  *
@@ -61,7 +65,11 @@ function makeCtx() {
       warn: (...args) => warnings.push(args.map(String).join(' ')),
       info: () => {},
     },
-    get: () => undefined,
+    get(name) {
+      // webServer 是 inject 硬依赖，见上方注释：给一个能注册路由的最小实现。
+      if (name === 'webServer') return { register: () => () => {} }
+      return undefined
+    },
     on: (event) => {
       events.push(event)
       return () => {}

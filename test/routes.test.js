@@ -395,11 +395,33 @@ describe('installRoutes', () => {
     assert.equal(routes.size, 0)
   })
 
-  it('没有 webServer 服务时静默降级', () => {
+  it('没有 webServer 时不抛错，但必须留下一条告警（静默是事故藏身处）', () => {
+    const warnings = []
     const ctx = { get: () => undefined, effect: (fn) => fn?.(), logger: { warn() {} } }
-    const dispose = installRoutes(ctx, makeDeps())
+    const deps = makeDeps({ logger: { warn: (...a) => warnings.push(a.map(String).join(' ')), info() {} } })
+    const dispose = installRoutes(ctx, deps)
     assert.equal(typeof dispose, 'function')
     assert.doesNotThrow(() => dispose())
+    assert.equal(warnings.length, 1, `拿不到 webServer 要恰好告警一次，实际：${JSON.stringify(warnings)}`)
+    assert.match(warnings[0], /webServer/, `告警要指名 webServer，实际：${warnings[0]}`)
+  })
+
+  it('webServer 由 inject 注入到 ctx 时也要能注册（不只看 ctx.get）', () => {
+    const routes = new Map()
+    const ctx = {
+      webServer: {
+        register(route) {
+          routes.set(route.path, route.handler)
+          return () => routes.delete(route.path)
+        },
+      },
+      // get 一律拿不到，逼这条路径只能走 ctx.webServer
+      get: () => undefined,
+      effect: (fn) => fn?.(),
+      logger: { warn() {}, info() {} },
+    }
+    installRoutes(ctx, makeDeps())
+    assert.equal(routes.size, 7, `注入态应当注册满 7 条路由，实际 ${routes.size} 条`)
   })
 })
 
