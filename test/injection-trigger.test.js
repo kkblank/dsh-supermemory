@@ -14,12 +14,14 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { createStore } from '../lib/core/store.js'
+import { appendEntries, emptyDocument, parseEntries } from '../lib/core/document.js'
 import { resolveConfig } from '../lib/host/config.js'
+import { CONSOLIDATE_SYSTEM_PROMPT } from '../lib/host/digest-input.js'
 import { createDigestRunner } from '../lib/host/digest.js'
 import { EMPTY_DIGEST, EMPTY_SNAPSHOT_TEXT, installInjection, SNAPSHOT_NOTICE } from '../lib/host/inject.js'
 
@@ -116,11 +118,15 @@ async function makeDigestHarness(options = {}) {
   if (store?.ready !== undefined) await store.ready
 
   let streamCalls = 0
-  const llmText = options.llmText ?? DIGEST_JSON
+  /** 最后一次 llm.stream 的入参（整编模式要断言 system 与 maxTokens）。 */
+  let lastStreamParams = null
+  // 整编用例要在读到条目 id 之后才能拼出模型输出，故留出可换文案的口子。
+  let llmText = options.llmText ?? DIGEST_JSON
   // 关键：stream 必须**同步**返回 AsyncIterable，不能是 Promise。
   const llm = {
-    stream() {
+    stream(params) {
       streamCalls += 1
+      lastStreamParams = params
       return (async function* () {
         yield { type: 'text-delta', index: 0, text: llmText }
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -202,6 +208,10 @@ async function makeDigestHarness(options = {}) {
     emitTurn,
     waitForRuns,
     streamCalls: () => streamCalls,
+    streamParams: () => lastStreamParams,
+    setLlmText: (text) => {
+      llmText = text
+    },
     cleanup,
   }
 }
@@ -677,4 +687,145 @@ test('总开关关闭：pre-step 不再更新快照，已有快照原样保留�
   assert.equal(h.session.pluginSnapshots().length, 1)
   assert.notEqual(h.session.pluginSnapshots()[0], before)
   assert.ok(h.session.pluginSnapshots()[0].data.content[0].text.includes(EMPTY_SNAPSHOT_TEXT))
+})
+
+// ——————————————————————————————————————————————
+// E) v4 整编模式的编排（契约 §V4.0.6）
+//
+// 这一节只盯编排层该负责的三件事：走没走对模式、失败时有没有守住"不写盘"、
+// 快照这道安全网有没有生效。对账算法本身的正确性由 test/consolidate-core.test.js 管。
+// ——————————————————————————————————————————————
+
+/** 造一份条目数达到整编阈值（默认 20 条）的 project 记忆。 */
+async function seedProject(h, count = 20) {
+  const items = []
+  for (let index = 0; index < count; index += 1) {
+    items.push({
+      time: `2026-01-01T${String(index % 24).padStart(2, '0')}:00:00.000Z`,
+      source: 'digest',
+      body: `第 ${index} 条项目事实：这条记忆用来把文档撑到整编阈值以上，正文本身没有额外含义。`,
+    })
+  }
+  await h.store.writeDoc({ kind: 'project', projectRoot: h.dir }, appendEntries(emptyDocument('项目记忆'), items), {})
+}
+
+/** 读 project 全文。 */
+async function readProject(h) {
+  const doc = await h.store.readDoc({ kind: 'project', projectRoot: h.dir })
+  return String(doc?.content ?? '')
+}
+
+/** 手动跑一次整理并返回 RunRecord。 */
+async function runManual(h) {
+  return h.runner.runDigest({ agent: h.ctx.services.agents.get('sess-main'), trigger: 'manual' })
+}
+
+test('整编模式：规模达标即走整编，落盘的是目标态，未提及的条目一条不少，原文进了快照', async (t) => {
+  const h = await makeDigestHarness()
+  t.after(h.cleanup)
+  await seedProject(h)
+  const before = await readProject(h)
+  const ids = parseEntries(before).map((entry) => entry.id)
+
+  h.setLlmText(JSON.stringify({
+    entries: [
+      { text: '第 0 条与第 1 条合并后的结论。', from: [ids[0], ids[1]] },
+      { text: '一条全新的项目事实。', from: [] },
+    ],
+    drop: [{ id: ids[2], reason: '该事实已失效，且没有可替代的说法' }],
+  }))
+
+  const record = await runManual(h)
+  assert.equal(record.ok, true, JSON.stringify(record))
+  assert.equal(h.streamParams().system, CONSOLIDATE_SYSTEM_PROMPT, '必须用整编提示词调模型')
+  assert.equal(record.mode, 'consolidate')
+  assert.deepEqual(
+    [record.consolidation.added, record.consolidation.merged, record.consolidation.dropped, record.consolidation.kept],
+    // added 数的是**本次写入的新条目**（合并产物那条也算），故结果条数 = kept + added = 19。
+    [2, 2, 1, 17],
+    JSON.stringify(record.consolidation),
+  )
+
+  const after = await readProject(h)
+  assert.ok(after.includes('第 0 条与第 1 条合并后的结论。'), '合并结果要落盘')
+  assert.ok(after.includes('一条全新的项目事实。'), '新增条目要落盘')
+  assert.equal(parseEntries(after).length, 19, '20 − 吸收 2 + 新增 1 − drop 1 = 19')
+  assert.ok(!after.includes('第 2 条项目事实'), '被 drop 的条目应已移除')
+  // 生命线：模型没点名的 17 条必须原样还在。
+  for (let index = 3; index < 20; index += 1) {
+    assert.ok(after.includes(`第 ${index} 条项目事实`), `未提及的第 ${index} 条被弄丢了`)
+  }
+
+  const dir = join(h.dir, '.dsh', 'memory', 'history')
+  const files = await readdir(dir)
+  assert.equal(files.length, 1, '整编落盘前要留一份原文快照')
+  assert.equal(await readFile(join(dir, files[0]), 'utf8'), before, '快照必须逐字节等于被覆盖的原文')
+})
+
+test('整编栅栏命中就拒绝落盘：原文一个字节不改，也不留快照', async (t) => {
+  const h = await makeDigestHarness()
+  t.after(h.cleanup)
+  await seedProject(h)
+  const before = await readProject(h)
+  const ids = parseEntries(before).map((entry) => entry.id)
+
+  // 20 条全吸收成一句话，体积远低于 minKeepRatio → SHRINK_GUARD。
+  h.setLlmText(JSON.stringify({ entries: [{ text: '全都合并成这一句。', from: ids }], drop: [] }))
+
+  const record = await runManual(h)
+  assert.equal(record.ok, false)
+  assert.match(String(record.error), /SHRINK_GUARD/, JSON.stringify(record))
+  assert.equal(await readProject(h), before, '被拒绝的整编不得改动原文')
+  await assert.rejects(readdir(join(h.dir, '.dsh', 'memory', 'history')), '栅栏拒绝时不该产生快照')
+})
+
+test('快照备不出来就拒绝覆盖：唯一的安全网缺失时宁可不写', async (t) => {
+  const h = await makeDigestHarness()
+  t.after(h.cleanup)
+  await seedProject(h)
+  const before = await readProject(h)
+  const ids = parseEntries(before).map((entry) => entry.id)
+  h.setLlmText(JSON.stringify({
+    entries: [{ text: '第 0 条与第 1 条合并后的结论。', from: [ids[0], ids[1]] }],
+    drop: [],
+  }))
+  h.store.writeDocSnapshot = undefined
+
+  const record = await runManual(h)
+  assert.equal(record.ok, false)
+  assert.match(String(record.error), /snapshot failed/, JSON.stringify(record))
+  assert.equal(await readProject(h), before, '没有快照兜底就不得覆盖记忆')
+})
+
+test('整编输入装不下：直接放弃整编，一次模型都不调，也不退回追加', async (t) => {
+  const h = await makeDigestHarness({ config: { digestMaxInputBytes: 600 } })
+  t.after(h.cleanup)
+  await seedProject(h)
+  const before = await readProject(h)
+
+  const record = await runManual(h)
+  assert.equal(record.ok, false)
+  assert.equal(h.streamCalls(), 0, '装不下就不该花钱调模型')
+  assert.match(String(record.error), /INPUT_OVERFLOW/, JSON.stringify(record))
+  assert.equal(await readProject(h), before)
+})
+
+test('冷却期内下一次整理退回追加：不重复整编', async (t) => {
+  const h = await makeDigestHarness()
+  t.after(h.cleanup)
+  await seedProject(h)
+  const ids = parseEntries(await readProject(h)).map((entry) => entry.id)
+
+  h.setLlmText(JSON.stringify({
+    entries: [{ text: '第 0 条与第 1 条合并后的结论。', from: [ids[0], ids[1]] }],
+    drop: [],
+  }))
+  const first = await runManual(h)
+  assert.equal(first.mode, 'consolidate', JSON.stringify(first))
+
+  h.setLlmText(DIGEST_JSON)
+  const second = await runManual(h)
+  assert.equal(second.ok, true, JSON.stringify(second))
+  assert.equal(second.mode, 'append', '刚整编过就落在冷却期里，第二次必须走追加')
+  assert.ok((await readProject(h)).includes('自动整理新增的事实'), '追加路径照常写回')
 })

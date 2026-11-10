@@ -1163,4 +1163,201 @@ if (deps.isEnabled?.() === false) return decision
 **基线**：350 个用例全绿，其中 `test/digest-prompt.test.js` 6 例守护本节文案——断言取「包含关键
 片段」式，改标点不红，删守则或弱化它必红；另有一例要求被禁措辞（计划、原先、后改为…）只能
 出现在带否定线索的行里，防止提示词自相矛盾，**新增正面使用这些词的规则时需同步改该用例，这是
-设计意图而非误报**。整理器 system 提示当前 881 字符（UTF-8 2163 字节）。
+设计意图而非误报**。
+
+**守则共用常量的准入规则**：整理器有两种模式（§V4.0），两种模式共用同一段守则常量，因此**每一句
+必须同时是追加时的要求、也是整编时的要求**。描述系统能力或某个模式独有前提的句子（「系统当前只能
+追加」「旧条目不会被清除」）属于该模式自己的规则区，写进共用常量就会在另一种模式里变成错误指令——
+§V3.9 首版就犯过一次，第 5 条带着「只能追加」被照抄进整编提示词，等于命令整编不许删除。`test/
+consolidate-input.test.js` 断言两个提示词的守则段逐字相等，防止两边各漂各的。
+
+**当前文案规模**：追加模式 system 提示 902 字符（UTF-8 2220 字节），整编模式 1546 字符（UTF-8
+3676 字节）。
+
+## V4.0 整理器整编模式（consolidate）
+
+整理器有两种模式，同一次调用只走一种：`append`（既有行为，追加新条目）与
+`consolidate`（整编：合并重复、改写过时、删除失效，产物是 project 记忆的**目标态**）。
+整编只作用于 `project`，`soul`/`user`/`global` 永不自动写的约束不变（§V2.3）。
+
+### V4.0.1 条目 id（`lib/core/document.js`）
+
+条目头行扩展为 `- <time> · source:<source> · id:<id>`，第三段**可选**，旧文件照读。
+
+```js
+ENTRY_HEAD = /^-\s+(\S+)\s+·\s+source:\s*(\S*)(?:\s+·\s+id:(\S+))?\s*$/
+deriveEntryId(time, body) -> string          // sha1(time + '\n' + body) 的 hex 前 5 位
+parseEntries(text) -> Array<{ id, time, source, body }>
+renderEntry(entry) -> string                 // entry.id 形如 /^[0-9a-f]{5,9}$/ 时才输出 · id:
+rebuildDocument(text, entries) -> string     // 整篇条目区替换，preamble 原样保留
+```
+
+- `parseEntries` 在条目头没有 `id:` 段时**派生**一个 id（`deriveEntryId`），不落盘；同一份文本
+  多次解析得到同一批 id。显式 id 优先于派生 id。
+- 一份文档内 id 必须唯一：派生 id 与显式 id 相撞时，把派生 id 逐位延长（5 → 7 → 9）直到不撞。
+- `appendEntries` 行为**完全不变**（不自动补 id），`renderEntry` 只在 `entry.id` 合法时输出该段。
+- **`id` 与 `explicitId` 都是不可枚举自有属性**：`entry.id` 照常可读，但 `Object.keys(entry)` 只有
+  `time` / `source` / `body`。这是刻意的，换来的性质更重要——`renderEntry` 见到不可枚举的
+  `explicitId === false` 就不输出 id 段，于是**任何人把 `parseEntries` 的结果直接喂给
+  `rebuildDocument` 都不会把派生 id 写进用户的记忆文件**，"派生 id 不落盘"由结构保证而不靠调用方
+  自觉。代价也已钉进用例：`{ ...entry }.id === undefined`、`JSON.stringify(entry)` 不含 id——需要
+  id 时必须读 `entry.id`，展开对象会静默丢掉它。手工构造 `{ id: 'a3f2c', ... }`（无 `explicitId`）
+  视为显式 id，照常渲染。
+- `rebuildDocument(text, entries)` 取原文本**第一个条目头之前**的全部内容（一级标题、维护注释、
+  用户手写说明段）作为 preamble 原样保留，条目区由 `entries` 重新渲染。原文本没有条目头时
+  整段视为 preamble，条目追加其后。
+- **`rebuildDocument` 是整编唯一的落盘构造方式**；不许用字符串替换去改条目。
+
+### V4.0.2 整编输出与对账（`lib/core/consolidate.js`）
+
+整编模式的模型输出格式（单行 JSON，无围栏）：
+
+```json
+{"entries":[{"text":"…","from":["a3f2c"]}],"drop":[{"id":"b8e01","reason":"…"}]}
+```
+
+- `from` 为空数组 = 全新条目；`from` 列出的每个 id 都是被这条新条目吸收/取代的旧条目。
+- `drop` 用于「事实已失效且无替代」的条目，`reason` 必填。
+
+```js
+extractJsonObject(text) -> object | null   // 唯一容错真源是 digest.js 的 pickJsonObject(text, prefer)
+parseConsolidateOutput(raw) -> { ok:true, entries, drop } | { ok:false, error }
+applyConsolidation(oldText, parsed, options) -> result
+// options: { time?: string, source?: string, minKeepRatio?, maxDropRatio? }
+//          time 缺省当前时间，source 缺省 'digest'
+// result:  { ok:true, text, counts:{added,merged,dropped,kept}, absorbedIds, droppedDetail,
+//            ghosts, duplicates, suspects }
+//        | { ok:false, reason:'SHRINK_GUARD'|'DROP_GUARD'|'EMPTY', bytesBefore, bytesAfter }
+shouldConsolidate({ enabled, entryCount, bytes, minEntries, minBytes, lastConsolidateAt, cooldownMs, now })
+  -> { consolidate: boolean, reason: 'disabled'|'below-threshold'|'cooldown'|'entry-count'|'bytes' }
+```
+
+**counts 语义是对外契约**（面板与 `/memory-digest` 文案都依赖它）：`added` = 本次写入的新条目数，
+**含合并与改写的产物**，所以结果条数恒等于 `kept + added`；`merged` = 被吸收的旧条目数。文案用
+「写入」而不是「新增」，因为后者会被读成净增条数。
+
+**容错 sanitize**：id 类字段（`from[]`、`drop[].id`）只接受字符串——把 `42` 变成 `'42'` 只会造出
+指向虚无的引用；`text` / `reason` 容忍非字符串；`entries` 里写成纯字符串的项按「纯新增条目」收下；
+`from` 转小写并去重。
+
+对账规则（`applyConsolidation`，纯函数，不碰磁盘）：
+
+1. 旧条目来自 `parseEntries(oldText)`，全部带 id。
+2. `from` / `drop` 里引用不存在的 id → **忽略该引用**，id 收进返回值的 `ghosts`，不影响其余。
+3. 被任一 `from` 吸收的旧条目：从结果中移除，由该条新条目替代。
+4. 被 `drop` 命中的旧条目：移除，`droppedDetail` 记录 id 与 reason。
+5. **既没被吸收也没被 drop 的旧条目：原文原时间戳原样保留**——这是"模型漏写不会丢记忆"的保证。
+6. 顺序：按旧条目原顺序遍历，新条目插入在其吸收的第一条旧条目原位；`from` 为空的纯新条目
+   追加到末尾。
+7. 栅栏（两道，任一命中即 `{ok:false}`，调用方**不写盘**）：
+   - `SHRINK_GUARD`：产物字节 < 原文字节 × `minKeepRatio`（默认 **0.15**）——防「20 条压成一句话」。
+   - `DROP_GUARD`：`dropped` > 旧条目总数 × `maxDropRatio`（默认 **0.5**）且 `merged == 0`——
+     纯删一半以上而没有任何合并动作，判为异常。
+   - `EMPTY`：产物条目数为 0 而原文条目数 > 0。
+   整编的正常缩水是**期望行为**，所以栅栏只兜极端退化，不设「不许变短」类阈值。
+8. 同一个旧 id 被两条以上新条目的 `from` 认领 → 第一个吸收者生效，其余引用忽略并记入
+   `duplicates`。它与 `ghosts` 分开是因为病因不同（查无此 id vs 重复认领），混进一个字段会让人
+   误判模型输出质量；`merged` 只算一次，结果不会凭空多出替代品。
+9. `drop` 认领一个已被 `from` 吸收的 id → 静默忽略，既不记 `droppedDetail` 也不记 `ghosts`
+   （模型常先合并再顺手补一条 drop，这不算异常）。
+10. `suspects` 是线索字段，不是栅栏：模型改写了某条却漏写 `from` 时，旧条目按规则 5 保留、新条目
+    也在结果里，文档会出现内容重复的两条。这是**可接受的退化**（重复但不丢，下次整编还能收），但
+    要把线索留下，让人发现「模型漏写 from 了」。判定：正文折叠空白与标点、转小写后前 40 字符指纹
+    相同（折叠后不足 8 字符不参与，否则短正文满屏误报）；一条旧条目最多报一次，不参与栅栏、不影响
+    `ok`。
+
+`shouldConsolidate` 的判定顺序是 开关 → 规模（条目数或体积任一达标）→ 冷却；`minEntries` /
+`minBytes` 缺省取 §V4.0.4 的 20 / 12288，这样 config 缺键也不会永久压制整编；`lastConsolidateAt`
+是非法时间串时按「没整编过」放行。
+
+### V4.0.3 整编提示与输入（`lib/host/digest-input.js`）
+
+```js
+export const CONSOLIDATE_SYSTEM_PROMPT: string
+buildConsolidateInput(docs, transcriptLines, maxBytes)
+  -> { ok:true, input: string } | { ok:false, reason:'INPUT_OVERFLOW'|'NO_PROJECT' }
+```
+
+- `CONSOLIDATE_SYSTEM_PROMPT` 只要求输出 V4.0.2 的 JSON，并**逐字沿用 §V3.9 的 6 条事实性守则**
+  （整编是清洗变更史的主战场，两者必须同源；建议把守则文本抽成共用常量再由两个提示拼接）。
+- 输入的「现有记忆」区把每条 project 条目渲染成 `[<id>] <body>`，供模型引用；**project 记忆
+  正文一律不截断**——截断等于让模型照着残缺稿重写，会丢条目。
+- 超预算时按**三级降级**，project 正文任何情况下都不截断：① 从对话尾部丢消息，可丢到 0 条；
+  ② 仍超则压缩 soul/user/global 三份参考（各按 `max(1024, limit/12)` 截尾）；③ 仍超才返回
+  `{ok:false, reason:'INPUT_OVERFLOW'}`，本次不整编。参考区只是去重与冲突上下文，压缩它们不损失
+  任何要落盘的信息，多保住一次整编机会比保住参考原文更有价值。
+- soul / user / global 三份在整编输入里只作为去重与冲突上下文，可截断。
+
+### V4.0.4 配置（`lib/host/config.js`）
+
+只读 `cordis.patch.yml`，**不进 `settings.json`**（面板不提供这些开关）：
+
+| 键 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `digestConsolidate` | boolean | `true` | 整编模式总开关 |
+| `digestConsolidateMinEntries` | integer ≥1 | `20` | 条目数阈值 |
+| `digestConsolidateMinBytes` | integer ≥1024 | `12288` | 体积阈值 |
+| `digestConsolidateCooldownMs` | integer ≥0 | `21600000` | 两次整编最小间隔（6 小时） |
+| `digestConsolidateMaxOutputTokens` | integer ≥256 | `6000` | 整编调用输出上限 |
+| `digestSnapshotKeep` | integer ≥1 | `3` | 落盘前快照保留份数 |
+
+非法值回退默认，规则与既有 `readNumber` / `readBoolean` 一致。§V3.8 的「四处一起改」对这 6 项的
+适用情况：第 1、2、3 处照改（zod `.default()` + `DEFAULTS` / `cordis.patch.yml` 显式值 /
+`test/paths-document.test.js` 的 defaults 常量）；**第 4 处 `lib/client.js` 豁免**——这些阈值不进
+面板，设置页不放开关。
+
+`writeDocSnapshot` 的两处语义补记：`keep` 非法回退 3、小于 1 钳到 1（否则会出现「刚写完就把自己
+删掉」）；裁剪排序用**码点字典序**而非 `localeCompare`（后者按 locale 给连字符降权，会破坏「定长
+时间戳 ⇒ 字典序即时间序」这个前提）。裁剪只处理符合快照命名的文件，快照目录里别人放的东西既不
+保留计数也不删除。
+
+### V4.0.5 落盘前快照（`lib/core/store.js`）
+
+```js
+writeDocSnapshot(ref, content, keep = 3) -> { ok:true, path, removed } | { ok:false, error }
+```
+
+- 位置：该文档同目录的 `history/` 子目录，文件名 `<原文件名去扩展>-<yyyyMMdd'T'HHmmss'Z'>-<4hex>.md`。
+- 内容：本次整编**替换掉的那份原文**，逐字节。
+- 裁剪：按文件名时间序保留最近 `keep` 份，多余删除。
+- 只在整编真正要写盘之前调用；追加模式不产生快照。快照目录随文档走，`.dsh/` 已被 `.gitignore` 排除。
+- 不提供回滚 API：恢复方式是人工从 `history/` 拷回，刻意不做自动回滚以免误覆盖新内容。
+
+### V4.0.6 编排与运行报告（`lib/host/digest.js`）
+
+`execute` 的分支：读 project → 数条目与字节 → `readRuns` 查最近一次成功的整编时间 →
+`shouldConsolidate` 决定模式 → 走对应路径。
+
+- 整编路径的**任一步失败**（`INPUT_OVERFLOW` / 解析失败 / `SHRINK_GUARD` / `DROP_GUARD` /
+  `EMPTY` / STALE / 快照失败）都**不写盘、也不退回去跑一次追加调用**，只在 RunRecord 里记
+  `ok:false` 与 `error`，等下一轮重新评估。整编的产物本身已含新增条目，失败即本轮不写。
+- **快照失败同样拒绝覆盖**：快照是这条路径上唯一的安全网，网没张开就不做有丢数据风险的动作。
+  所以 `writeDocSnapshot` 缺失或返回 `{ok:false}` 时结果是 `error: 'snapshot failed: …'`，
+  而不是"跳过备份继续写"。
+- **模式判定本身出错就走追加**（保守侧），不因 `parseEntries` / `readRuns` 抛异常而让整次整理失败。
+- 落盘前重读一次文档：mtime 与本次开始读取时不一致 → 判 STALE 放弃，**不拿旧底稿覆盖新内容，
+  也不半途重算一遍对账**（半途改判会让已算出的栅栏结论与待写内容来自两份不同的底稿）。
+- `RunRecord.counts` 的四个 key（soul/user/global/project）与既有语义**完全不变**；
+  整编模式 `counts.project` = 本次写入的新条目数（`added`，含合并产物，见 §V4.0.2）。
+  整编细节写在**新增字段**：
+
+```js
+record.mode = 'append' | 'consolidate'
+record.consolidation = {
+  added, merged, dropped, kept,
+  ghosts: [id], duplicates: [id], suspects: [id],
+  snapshot: '快照绝对路径' | null,
+}
+```
+
+  `suspects` 只存 id（明细可能很长，运行报告只留线索）；`snapshot` 存绝对路径，因为它是给主人
+  手工恢复用的，路径可定位比好看重要。**没有 rollback API 是有意设计**：恢复方式就是把快照文件
+  复制回 `.dsh/memory/project-memory.md`，插件不代做这个决定。
+
+  既有面板、`/memory-digest` 文案、`runs` 接口对老记录的行为不变；新字段存在时才额外展示整合明细。
+
+### V4.0.7 测试归属
+
+`test/document-entry-id.test.js`、`test/consolidate-core.test.js`（id 往返与对账）、
+`test/consolidate-input.test.js`（提示与输入预算）、`test/store-snapshot.test.js` 与
+`test/config-consolidate.test.js`（快照与配置）、`test/injection-trigger.test.js` 内的整编编排用例。

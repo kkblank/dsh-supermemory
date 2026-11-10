@@ -331,6 +331,9 @@ describe('document', () => {
 })
 
 describe('resolveConfig', () => {
+  // ⚠️ 这是全量比对（deepStrictEqual）：`resolveConfig` 每加一个配置键，这里必须同步补上
+  // 该键的默认值，否则本用例必红——这是**故意**的，专门用来挡住「加了配置键忘了写默认值」。
+  // 相关的逐项规则用例在 `test/config-consolidate.test.js`，两处默认值都要照 §V4.0.4 表格。
   const defaults = {
     enabled: true,
     personasRoot: '',
@@ -349,6 +352,13 @@ describe('resolveConfig', () => {
     digestModel: '',
     injectIntoSubagents: false,
     compactionRecall: true,
+    // 整编模式（契约 §V4.0.4）：只从配置文件读，不进面板 / settings.json。
+    digestConsolidate: true,
+    digestConsolidateMinEntries: 20,
+    digestConsolidateMinBytes: 12288,
+    digestConsolidateCooldownMs: 21600000,
+    digestConsolidateMaxOutputTokens: 6000,
+    digestSnapshotKeep: 3,
   }
 
   test('undefined / null / 非对象 → 全默认', () => {

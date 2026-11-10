@@ -16,7 +16,17 @@
         autoDigest: true
         digestEveryTurns: 5
         digestPressureRatio: 0.75
-        # 子智能体默认不带记忆：必须显式写 false。
-        # patch 是 insert 语义，不会撤销上一次已落进 profile 的旧值，
-        # 删掉这行会让残留的 true 继续生效。
+        # 子智能体默认不带记忆。写显式 false 是为了让默认值在配置文件里可见，不必去翻
+        # zod default。实测本机 link 安装方式下配置树从未落过 supermemory 的 config 段，
+        # 删掉这行走的是 zod 新默认值，不会被残留旧值压住；但若日后改成复制到 profile
+        # 的安装方式，显式写出依然是更安全的一侧（契约 §V3.8）。
         injectIntoSubagents: false
+        # 整编（契约 §V4.0）：project 记忆条目数或体积达标后，下一次整理升级为整编模式，
+        # 产物是整份目标态而非增量；落盘前先把原文快照到 .dsh/memory/history/。
+        # 阈值只在这里配，面板不提供（§V4.0.4）。
+        digestConsolidate: true
+        digestConsolidateMinEntries: 20
+        digestConsolidateMinBytes: 12288
+        digestConsolidateCooldownMs: 21600000
+        digestConsolidateMaxOutputTokens: 6000
+        digestSnapshotKeep: 3
