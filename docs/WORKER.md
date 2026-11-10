@@ -44,7 +44,16 @@ $ node -e "import('@deepseek-ai/dsh-llm')"   → ERR_MODULE_NOT_FOUND
 cd /path/to/dsh-supermemory        # 本仓库根目录
 node --check lib/你的文件.js          # 每个文件都要过
 node --test test/你的测试.js          # 你负责的测试必须全绿
+node --test --test-concurrency=1    # 交活前跑全量，串行口径，必须 0 fail
 ```
+
+**测试的三条硬约定**（踩过，别再踩）：
+
+- **全量必须串行 `--test-concurrency=1`**。默认并发下注入相关用例会互相干扰，抖出二十多条
+  与改动无关的假红，而且同一份代码不同人看到的红名单还不一致——一份每人不同的红名单没有价值。
+- **不要写 `node --test test/`**（目录形式），本机 Node 24 会把它当模块解析。
+- **渲染层用例一律显式传预算**，不许吃配置默认值。这样调默认预算只需同步配置侧那几处断言，
+  渲染用例不会被连带改红；反过来，渲染用例也不许改成吃默认预算来"少写几个参数"。
 
 测试用 `node:test` + `node:assert/strict`，不装任何依赖。
 测试涉及文件系统时用 `node:fs.mkdtemp` 建临时目录，`after` 里清理。

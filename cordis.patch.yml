@@ -33,6 +33,11 @@
         digestConsolidateMinEntries: 20
         digestConsolidateMinBytes: 12288
         digestConsolidateCooldownMs: 21600000
-        # 整编要重写整份记忆，思考量比追加模式大得多（实测一次 5942 tokens 思考 + 1.7KB 正文）。
-        digestConsolidateMaxOutputTokens: 16000
+        # 整编要重写整份记忆，思考量比追加模式大得多，而且**与待重述的记忆规模成正比**：
+        # 实测正文 1683 字节配 5942 tokens 思考（约 9 倍），当时给 16000 够用；
+        # 记忆长到 32 条 / 12KB 后需重述全部条目，思考量按同比例约 49k tokens，16000 被吃穿、
+        # 正文一个字没产出，报错表现为「输出被 maxTokens 截断」。
+        # 本值是显式配置，会压住 config.js 的 zod default（改默认值对本机无效，只影响新用户）。
+        # 记忆再长大若再次报截断，继续上调本值；256K 窗口下 60k 输出仍远未触及输入上限。
+        digestConsolidateMaxOutputTokens: 60000
         digestSnapshotKeep: 3

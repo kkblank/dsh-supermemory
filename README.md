@@ -13,15 +13,17 @@
 | 能力 | 说明 |
 |---|---|
 | 自动注入 | 新建会话时，提示词里自动出现人格、用户画像、全局记忆、项目记忆 |
+| 分层注入 | 项目记忆分**常驻 / 目录 / 冷层**三层：常驻照旧注入，冷层不进上下文，中间用一份主题目录（每主题一行）说明"有什么、讲什么、用什么词能捞到" |
+| 按需读取 | 冷层内容靠 `memory search` 取回；注入时还会按本轮发言从冷层临时捞几条，带轮数冷却 |
 | 按人设隔离 | `soul.md` / `user.md` / `global-memory.md` 每个人设一份 |
 | 按项目隔离 | `<项目根>/.dsh/memory/project-memory.md`，不同项目互不可见 |
 | 单条快照 | 记忆内容变化后下一次请求即生效，历史里始终只有一条最新快照，不随轮次累积 |
-| Web 面板 | 侧栏「记忆」图标 → 独立面板，切换人设/项目、编辑保存、mtime 冲突检测 |
+| Web 面板 | 侧栏「记忆」图标 → 独立面板，切换人设/项目、编辑保存、mtime 冲突检测、**分层概览** |
 | 设置页 | 只读概览：目录、预算占用、触发阈值、最近整理 |
 | 手动整理 | 每 N 轮 / 上下文压力超阈值 / 手动按钮触发，**只写项目记忆** |
 | 整理模型可选 | 面板里从已配置模型中选择整理用的模型，或跟随当前会话 |
 | `memory` 工具 | Agent 可 list / read / search / append / replace / digest |
-| 预算降级 | 记忆超预算时自动降级为「索引 + 摘要」，不会无限膨胀提示词 |
+| 预算降级 | 各段预算**各自独立**降级：项目段超额只影响项目段，不会把全局记忆一起削掉 |
 | 压缩补偿 | 上下文被压缩摘要覆盖后，下一轮自动重写完整记忆快照；digest 不变、不会多出第二条 |
 
 ## 写入策略（v2 起）
@@ -64,6 +66,9 @@ $DSH_HOME/supermemory/
 ```
 <项目根>/.dsh/memory/
   project-memory.md                # 该项目专属记忆
+  pitfalls.md                      # 同目录全部 .md 一视同仁进检索范围（文件名不限）
+  usage.json                       # 检索与预取的命中热度，按条目与主题名记账
+  history/                         # 整编前的原文快照
 ```
 
 - **人设**：面板下拉里的条目，可新增。每个拥有独立的 soul/user/global。
@@ -98,21 +103,31 @@ $DSH_HOME/supermemory/
 
 ```
 <supermemory>
-## 人格 (soul)
-...
-## 用户画像 (user)
-...
 ## 全局长期记忆 (global)
 ...
 ## 项目记忆 (project: <项目根名>)
+...（常驻层条目的正文）
+
+### 主题目录
+- 注入机制（4条）：这个主题大致在讲什么 → 注入, 快照, surface, append
+- 面板路由（2条）：… → 面板, client, 404
 ...
+冷层条目用 memory 工具按需检索（action=search, scope=project）。
+
+## 本轮相关记忆
+...（按本轮发言从冷层临时捞回的若干条，冷却期内保持不变）
 </supermemory>
 ```
 
-- 内容里的 `</supermemory>` 会被转义，防止提前闭合。
+- **人格与画像不在这条消息里**——它们只走系统提示那一份，快照正文只含全局与项目两段，
+  避免同一份内容每轮被注入两遍。
+- 内容里的 `</supermemory>` 会被转义（在 `<` 后插反斜杠），防止提前闭合冲破结构。
 - `{{...}}` 按字面量保留（section 用 `interpolate: false`）。
-- 四段合并字节超 `injectMaxBytes` 时，改为输出索引（每文件标题、一级小节、
-  更新时间、字节数）+ 一行「完整内容可用 memory 工具按需读取。」
+- **各段预算各自独立**：`projectCoreMaxBytes` 管常驻正文、`projectIndexMaxBytes` 管主题目录、
+  冷层临时捞取另有上限。哪一段超额只在那一段内部降级，**全局记忆永不被项目段拖累**。
+- 常驻正文装不下时，被挤出的条目**临时**折进目录（标注「本轮被预算挤出」并给出取回方式），
+  下一轮预算宽裕会自动回来——这是渲染期的临时折叠，不写回磁盘、不改变条目的分层身份。
+- 目录里的每个主题一行同时给出检索别名，让模型知道用什么词能把冷层内容捞出来。
 
 **压缩之后**：宿主压缩会写一条 checkpoint，用 `surfaceOp: replace` 把整段
 surface 区间换掉，本插件的快照可能被一起吞掉。因此每轮 pre-step 都做一次
@@ -141,7 +156,19 @@ surface 区间换掉，本插件的快照可能被一起吞掉。因此每轮 pr
 | `digestProvider` / `digestModel` | 空 | 默认整理模型；面板里选的值优先 |
 | `digestWritableScopes` | `['project']` | 整理可写的分区（v2 硬限制为 `project`） |
 | `injectIntoSubagents` | `false` | 子智能体是否带记忆；默认**不带**，需要时显式配 `true` |
-| `compactionRecall` | `true` | 压缩后快照自愈与补偿重写；`false` 退回「仅内容变化才重写」 |
+| `compactionRecall` | `true` | 压缩后快照自愈与补偿重写；`false` 退回「仅内容变化才重写」。**与下面 `projectRecall*` 的按轮预取无关，只是撞名** |
+| `digestConsolidate` | `true` | 整编模式开关：条目数或体积达标后，整理从"追加"升级为"重写整份目标态" |
+| `digestConsolidateMinEntries` | `20` | 触发整编的条目数 |
+| `digestConsolidateMinBytes` | `12288` | 触发整编的体积 |
+| `digestConsolidateCooldownMs` | `21600000` | 两次整编的最小间隔（6 小时） |
+| `digestConsolidateMaxOutputTokens` | `12000` | **整编输出上限，推理模型必读**：思考内容也算输出并先扣这份预算，且**与待重述的记忆规模成正比**。本机实测记忆长到 32 条 / 12KB 时需 ≈55k tokens，故显式配到 `60000`；配小了症状是"正文写完前思考就被截断、整理失败" |
+| `tieredInjection` | `true` | 分层注入总开关；`false` 退回整份项目记忆全量注入 |
+| `projectCoreMaxBytes` | `16384` | 常驻层正文预算，超额条目临时折进目录 |
+| `projectIndexMaxBytes` | `3072` | 主题目录预算 |
+| `projectRecallMinRounds` | `3` | 冷层临时捞取的最小间隔轮数（防每轮换血） |
+
+> 整编阈值与预算属于**运维旋钮，只从 `cordis.patch.yml` 读，面板不提供**；
+> 显式写出的值会压住代码里的默认值——改默认值对已显式配置的机器无效。
 
 > 旧字段名 `presetsRoot` 仍被接受，等价于 `personasRoot`。
 
@@ -162,6 +189,12 @@ surface 区间换掉，本插件的快照可能被一起吞掉。因此每轮 pr
 `project` 作用域的项目根由会话 cwd 自动解析，**不接受模型传入任意路径**；
 所有路径穿越都被拒绝。
 
+`scope: project` 的检索覆盖 `<项目根>/.dsh/memory/` 下**全部 `.md`**（含 `pitfalls.md`
+这类自建记录文件，以及 `history/` 里的整编前快照，后者仅在别处无命中时兜底再搜）；
+人格、画像、全局记忆仍各只读自己那一个文件。
+每次检索与每次冷层捞取的命中会按条目与主题名计入 `usage.json`，
+整理器据此判断哪些主题真的被用过——**这份热度是条目在常驻层与冷层之间迁移的主要依据**。
+
 ## 斜杠命令
 
 - `/remember [scope] <内容>` —— 等价 `memory append`，默认 `global`
@@ -176,6 +209,12 @@ surface 区间换掉，本插件的快照可能被一起吞掉。因此每轮 pr
 ## 已知边界
 
 - 不做向量/embedding 语义检索（纯 md + 词法检索；中文按相邻二元组近似分词）。
+- **条目的分层身份由整理器判断，不是算法自动分的**：判高了浪费预算，判低了要靠热度慢慢升回来。
+  主题表也只由整理器维护，写入侧不接受自定义主题名——自由命名会让热度记账断链。
+- **主题名是热度记账的锚点**：整理器给同一件事换了个名字，那份热度就挂在旧名字上从零重新开始。
+  面板的「孤儿主题」非空是这个情况的现成信号。
+- **冷层内容没人检索就等于不存在**：它依赖模型主动搜或本轮发言恰好命中；
+  检索不到又确实重要的内容应留在常驻层。
 - 压缩补偿只重发快照，不改写压缩摘要，也不保证摘要本身保留了记忆内容。
 - 不做文件版本历史与回滚。
 - 不做敏感信息过滤。
@@ -184,27 +223,8 @@ surface 区间换掉，本插件的快照可能被一起吞掉。因此每轮 pr
 
 ## 开发
 
-```bash
-node --test          # 全部单测（344 个用例）
-```
-
-`test/` 下按模块分组：
-
-| 文件 | 覆盖 |
-|---|---|
-| `paths-document.test.js` | 人设 slug（含中文）、项目根、安全 join、md 文档格式、配置 |
-| `store.test.js` | 原子写、mtime 冲突、并发写、人设注册表、settings、迁移、runs |
-| `render-digest.test.js` | 注入渲染、预算降级、转义、整理解析与合并 |
-| `host-install.test.js` | 注入链路、memory 工具、soul 写保护、斜杠命令 |
-| `routes.test.js` | HTTP 路由、models/settings/personas、STALE 冲突、整理器 |
-| `injection-trigger.test.js` | 自动整理触发（轮数 / 压力 / 负向拦截）+ 只写 project |
-| `compaction-recall.test.js` | 压缩遮蔽识别、快照重建、防抖动、开关对照 |
-| `search.test.js` | 分词与中文二元组、块聚合打分、排序截断、字面兜底 |
-| `client-toggle.test.js` | 面板总开关前端态 |
-| `trust-fence.test.js` | 信任栅栏五维矩阵 |
-
-本地跑测试需要 `@deepseek-ai/schemastery`（唯一宿主依赖，仅 `lib/host/config.js` 使用）。
-工作区的 `node_modules/@deepseek-ai/` 是开发时的副本，已由 `.gitignore` 排除；
+运行期唯一的宿主依赖是 `@deepseek-ai/schemastery`，只在 `lib/host/config.js` 使用；
+工作区的 `node_modules/@deepseek-ai/` 是本地开发用的副本，已由 `.gitignore` 排除，
 插件安装到 profile 后从 profile 的 `node_modules` 解析，不依赖这份副本。
 
 `docs/CONTRACT.md` 是模块契约（末尾「v2 变更」章节覆盖前文的 preset 概念），

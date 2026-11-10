@@ -1833,3 +1833,675 @@ append 完 `system/message` 之后、构造请求之前，会把其中非 `runti
   而非 `ctx.get`）也要能注册满 7 条。
 - 序号一律取 `append` 的返回值，不硬编码数字：夹具预置事件会让 seq 位移，写死只会在夹具
   变动时误报成回归。
+
+---
+
+# v8 变更：分层记忆（core / index / cold）
+
+> 本节优先于前文全部版本，冲突处以本节为准。目标是**让注入量与记忆总量解耦**：
+> 项目记忆可以无上限增长，而每轮常驻上下文成本近似常数，冷层信息仍然查得到。
+
+## V8.0 三条产品决策（已与用户确认，不再讨论）
+
+1. **单文件 + 字段扩展**：冷层不拆新文件，条目头新增可选 `tier` / `topic` 段，沿用 v4 加
+   `id` 的兼容路径。理由：store / 面板 / 整编器全部只是扩展，存量文件照读。
+2. **动态预取要做，带冷却与变化阈值**：pre-step 用本轮用户输入检索冷层，命中的条目临时进快照。
+   只做目录不做预取等于半截子工程——**模型不会主动去查它不知道自己存在的东西**。
+3. **检索用词法 + 整理器生成的 aliases，不引入 embedding**：不新增任何依赖，不走模型调用，
+   结果可解释。别名（中英关键词）是"穷人版 embedding"。
+
+### 三条贯穿全局的不变量（实现时反复回来对照）
+
+- **渲染期裁剪，存储期只表意图。** 盘上的 `tier` 只表达"这条该常驻"。预算真不够时由渲染层按
+  热度把最不该常驻的条目临时折进目录，**绝不回写文件**。否则一次预算抖动就会反复改写记忆文件。
+- **段级独立降级。** 任何一段超预算只降它自己。今天"project 太长导致人格一起被降级成索引行"
+  是本版要根除的第一个缺陷。
+- **缺省 = 旧行为。** 缺 `tier` 视为 `core`，缺 `topic` 视为未分类。存量记忆在升级瞬间
+  一条都不会从上下文消失。**升级后首次注入的 project 正文必须与升级前逐字节一致。**
+
+### 三层定义
+
+| 层 | 内容 | 是否进上下文 | 预算键 |
+|---|---|---|---|
+| L0 core | 每轮都必须为真的事实：硬约束、技术栈、测试基线 | 是，正文 | `projectCoreMaxBytes` |
+| L1 index | 主题目录，每主题一行 | 是，一行摘要 + 别名 | `projectIndexMaxBytes` |
+| L2 cold | 全量条目，只被 search / 预取命中 | 否 | — |
+
+## V8.1 阶段一：止血（不依赖分层，先独立交付）
+
+### V8.1.1 人格与画像不再注入两遍（`lib/host/inject.js`）
+
+实测 soul + user ≈ 5 KB，现在**同时**在 `systemPrompt` 的 `supermemory:persona` 和快照里各存
+一份，每轮白烧 5 KB。
+
+- pre-step 不再读 soul / user，只读 `global` 与 `project`。
+- soul / user 的**唯一出口**是 `systemPrompt.section`；超预算由 `buildPersonaSection` 现有的
+  「先保 soul 再截 user」负责，`systemPromptMaxBytes`（12000）不变。
+- 快照的 `source.sections` / `byteSections` 随之只含 `global` / `project`。**面板按 `sections`
+  渲染的分支要跟着验一遍**（`lib/client.js`，D 负责）。
+- `buildEmptySnapshotMessage` 的 `byteSections` 同步成两键。
+
+### V8.1.2 降级从全量改为段级（`lib/core/render.js`）
+
+`buildSnapshot` 今天超限就把所有段换成索引（`truncated: true`）。改成按序收敛：
+
+1. 全量；
+2. 装不下 → project 段收缩（v8.2 后 = core 正文 + 目录；v8.1 阶段 = 直接走目录），
+   **`global` 仍逐字全量**；
+3. 仍装不下 → 砍目录条数，保住固定提示行与合法包裹（复用 `fitWrappedIndex` 的优先级）。
+
+`soul` / `user` / `global` **永不被降级**。`fingerprint` 仍对原始正文取哈希（v3 注释里
+"降级后索引相同会误判没变"的理由继续成立）。
+
+## V8.2 条目格式：`tier` 与 `topic`（`lib/core/document.js`，A 负责）
+
+条目头从最多三段扩到最多五段，**全部可选、旧文件照读**：
+
+```md
+- 2026-11-10T10:00:00.000Z · source:user-request · id:a3f2c · tier:cold · topic:注入机制
+```
+
+- `ENTRY_HEAD` 扩为命名捕获组，段顺序固定 `time · source: · id: · tier: · topic:`；
+  缺段但写了后面的段 → 整行不认作条目头（宁可退回正文，也不要错位解析）。
+- `tier` 合法值只有 `core` 与 `cold`，**非法值视同没写**（同"不合法 `id:` 段退回派生"的哲学）。
+  **缺省 = `core`**。
+- `topic`：1–24 字符，原样保留（含中文与空格）；超长或空视同没写。
+- `parseEntries` 每项新增**不可枚举**属性 `tier`、`explicitTier`、`topic`、`explicitTopic`
+  （理由与 `defineEntryId` 完全相同：`test/paths-document.test.js` 的
+  `deepEqual(entry, { time, source, body })` 不能被新字段打红）。`entry.tier` 照读无误，
+  `{ ...entry }` 与 `JSON.stringify(entry)` 会静默丢掉它——和 `id` 同一套下游注意。
+- `renderEntry` 的写盘规则（**方向别写反**）：
+  - `tier === 'cold'` 且 `explicitTier !== false` → 输出 ` · tier:cold`；
+  - `tier === 'core'`（缺省态）→ **不输出**该段。因为存量条目全是 core，全写一遍会把整篇
+    变成 diff 噪音；
+  - `topic` 非空且 `explicitTopic !== false` → 输出 ` · topic:<topic>`；
+  - 输出顺序恒为 `id` → `tier` → `topic`。
+- 派生的缺省值（`explicitTier === false`）不落盘，与派生 id 完全同构。
+- `rebuildDocument` / `appendEntries` 自动透传，**禁止用字符串替换改条目**（v1 起的理由不变：
+  正文里一个 `- 2026…` 就能把改写带偏）。
+
+## V8.3 主题索引（`lib/core/topics.js` 新增，A 负责）
+
+主题级的摘要与别名存在 **project 记忆文档的 preamble**，用受控注释围栏承载：
+
+```md
+# 项目记忆
+
+<!-- 由 dsh-supermemory 维护；可直接编辑。 -->
+
+<!-- supermemory:topics:start -->
+- 注入机制 · 快照如何落盘与压缩补偿 · aliases: snapshot, inject, 快照
+- 整编模式 · consolidate 的栅栏与对账 · aliases: consolidate, 合并
+<!-- supermemory:topics:end -->
+
+## 条目
+```
+
+为什么放 preamble：`rebuildDocument` 保证**第一个条目头之前的 preamble 逐字保留**，条目区
+整体重写——这是现成的安全边界。不新增文件、不新增故障点，`memory read project` 顺带可见。
+
+三个导出（纯函数，无 IO）：
+
+- `parseTopicIndex(text)` → `Array<{ name, summary, aliases: string[] }>`；围栏缺失/畸形返回 `[]`，
+  单行畸形只丢那一行。
+- `renderTopicIndex(topics)` → 含围栏的文本块；空数组返回 `''`。
+- `upsertTopicIndex(text, topics)` → 替换围栏内内容；围栏不存在时插到**第一个条目头之前**
+  （无条目头则追加到末尾），preamble 其余内容一字不动；`topics` 为空时删除围栏。
+
+**必须点明的坑**：`inject.js` 的 `docBody` 会 `stripComments`，主题围栏在注入前就被剥掉了。
+这是**正确的**——目录由渲染层生成，不让原文透传，否则主题表会在快照里出现两遍。所以
+`buildProjectSection` 必须自己拿**原始文档文本**解析，不能拿 `docBody` 之后的正文。
+
+**一致性栅栏**：目录以**条目上实际写的 `topic` 为准**，主题表只提供摘要与别名。
+条目写了表里没有的 topic → 摘要用该条目正文首句兜底、别名留空；表里有但没条目用 → 该主题
+不出现（不显示空壳）。
+
+## V8.4 分层渲染（`lib/core/render.js`，A 负责）
+
+`buildSnapshot` **旧签名与旧行为一律不变**，继续服务 `tieredInjection: false` 的回滚通道和全部
+既有测试。分层走新函数：
+
+```js
+buildProjectSection({ text, projectName, usage, coreMaxBytes, indexMaxBytes })
+// → { text, coreCount, coldCount, topics, overflow, bytes }
+buildTieredSnapshot({ global, projectText, projectName, usage, recall,
+                      injectMaxBytes, coreMaxBytes, indexMaxBytes, recallMaxBytes })
+// → { text, digest, truncated, sections, stats }
+```
+
+`buildProjectSection` 的算法（顺序固定）：
+
+1. `parseEntries(text)` + `parseTopicIndex(text)`；按 `tier` 分组。
+2. core 组按 `score = w1 * log(1 + hits) + w2 * recency` 排序（`usage` 缺失 → 全 0 → 退回时间
+   倒序，**没有统计文件也必须能跑**）。
+3. core 累加到 `coreMaxBytes` 为止，溢出条目进 `overflow` 并**折进目录，不写文件**（不变量一）。
+4. 目录段：每主题一行 `- 主题（N条）：摘要 → 别名`，累加到 `indexMaxBytes` 为止，溢出砍主题数。
+5. 结尾固定一行：`冷层条目用 memory 工具按需检索（action=search, scope=project）。`
+
+`buildTieredSnapshot` 的 `digest` 必须覆盖**原始 global 正文 + project 原文 + projectName +
+truncated + 预取命中 id 集合**。预取 id 集合不进 digest 的后果：预取换了条目但快照不重写，
+本轮检索白做。
+
+`sections` 字节口径保持"每段渲染后字节数"。
+
+## V8.5 配置（`lib/host/config.js`，Lead 负责）
+
+全部 `.volatile()`，走现有 `readBoolean` / `readNumber`，非法值回退默认、越界钳制，
+同步补进 `DEFAULTS` 与 `resolveConfig` 返回集：
+
+| 键 | 默认 | 下限 | 说明 |
+|---|---|---|---|
+| `tieredInjection` | `true` | — | 分层总开关；`false` **逐字**退回 v7 渲染路径 |
+| `projectCoreMaxBytes` | `16384` | 1024 | core 段硬预算，见下方「默认值为何留宽」 |
+| `projectIndexMaxBytes` | `3072` | 512 | 目录段硬预算 |
+| `projectRecallMaxBytes` | `2048` | 512 | 预取段硬预算 |
+| `projectRecallTopK` | `5` | 1 | 预取条数 |
+| `projectRecallMinRounds` | `3` | 0 | 预取换血最小间隔（轮） |
+
+**`projectCoreMaxBytes` 默认值为何是 16384 而不是 8192（实测纠正，别再改回去）**：
+真实项目记忆 9 KB / 25 条时，8192 的预算会在 `injectMaxBytes: 24000` 只用了一半的情况下
+把 4 条挤进目录，而目录里只剩「未分类（4条）」一行——**升级当天就净丢信息**。实测数据：
+
+| coreMaxBytes | 正文条目 | 折进目录 | 结论 |
+|---|---|---|---|
+| 8192 | 21 | 4 | ❌ 总预算宽裕却丢信息 |
+| ≥12288 | 25 | 0 | ✅ 零折叠 |
+
+core 段该收缩的时机是「总量逼近 `injectMaxBytes`」，不是「超过一个凭空的软上限」。
+
+这 6 项与 v4 的整编阈值同性质（运维旋钮，不进面板 / `settings.json`），只从 `cordis.patch.yml` 读。
+
+## V8.6 存储层：项目记忆目录的多文档枚举（`lib/core/store.js`，C 负责）
+
+今天检索只覆盖四个记忆文件，**`pitfalls.md` 查不到**——最该被检索的东西恰好不可查。
+
+新增 `listProjectDocs({ projectRoot })` → `{ ok, docs: Array<{ name, bytes }> }`：
+
+- 只列 `<projectRoot>/<projectDirName>/*.md`，**排除 `history/` 子目录**；
+- 排序稳定（按 `name` 字典序）；目录不存在 → `{ ok: true, docs: [] }`，**不报错**。
+
+命中项的 `file` 字段由工具层填。
+
+## V8.7 工具层（`lib/host/tools.js`，B 负责）
+
+- `search` 命中项新增 `tier`、`topic`、`file`；**必须同步 `MATCH_SCHEMA`**——
+  `OUTPUT_SCHEMA` 未声明的返回键会让整个调用被判 invalid output，一条命中都拿不回来（踩坑第 4 节）。
+- project scope 检索目标从单文件扩为 `listProjectDocs` 的全部 md，排除 `history/`。
+  排序沿用"全局排序后截 40 条"。
+- `append` 新增可选 `tier`（enum `core` / `cold`），**默认 `cold`**。`PARAMETERS` 与 `DESCRIPTION`
+  同步：模型主动 append 默认落冷层，只有主人明确要求"必须始终知道"才写 `core`。
+- `list` 增加 core / cold 条数、主题数、各段字节。
+
+## V8.8 整编输出三键（`lib/core/consolidate.js`、`lib/host/digest-input.js`、`lib/host/digest.js`，C 负责）
+
+```json
+{"entries":[{"text":"…","from":["a3f2c"],"tier":"cold","topic":"注入机制"}],
+ "drop":[{"id":"b8e01","reason":"…"}],
+ "topics":[{"name":"注入机制","summary":"…","aliases":["snapshot","快照"]}]}
+```
+
+- `parseConsolidateOutput` 增加 `topics` 解析与非法值丢弃；`applyConsolidation` 对 `tier` /
+  `topic` 按 `from` 继承旧值，模型未写 → **保持原条目不动**（延续"没写不等于删除"）。
+- 新增两类对账计数：非法 `tier` 值 → 视同没写并记入 `suspects`；`topics` 里出现没有条目使用的
+  名字 → 记 `orphanTopics`。既有 `ghosts` / `duplicates` / `kept` 语义不变。
+- 落盘顺序固定：**先 `rebuildDocument` 重建条目区，再 `upsertTopicIndex` 写主题围栏**，两步都
+  成功才写盘；任一失败整轮放弃（保护快照回滚语义）。
+- **提示词三处同步**（漏一处必漂移，当初事实性守则就是三处）：`DIGEST_SYSTEM_PROMPT`（整编）、
+  追加模式提示、`tools.js` 的 `DESCRIPTION`。要点：常驻预算有限，只有"每轮都必须为真"的硬
+  约束/技术栈/基线才配 `core`；`topic` 用名词短语、≤12 字、**同义主题必须归并到已有名字**
+  （整编器看得见全量条目，归并由它负责）；不确定就别写 `tier`。
+- 整编输入里带上 topic 热度摘要，提示词要求"长期零命中且非硬约束的 core 条目降到 cold，反复
+  被检索的 cold 主题提升到 core"。
+- 本地 qwen 是推理模型：三键比两键长，复核 `digestConsolidateMaxOutputTokens`（6000）是否覆盖
+  reasoning tokens，不足则上调（踩坑第 5 节）。
+
+## V8.9 动态预取（`lib/host/inject.js`，B 负责）
+
+- pre-step 从 `agent.session` 取最近一条 user 消息（读不到、或那正是插件自己的快照 →
+  **跳过预取**，静默降级不报错）。
+- `queryTerms` → `scoredLines` 跑 project 全部 md → top-K，**剔除 core 段已在场的条目**。
+  分数下限沿用 `MIN_BLOCK_HITS` 思路；无命中 → 预取段为空，**不发空标题**。
+- 渲染为快照内独立小节 `## 本轮相关记忆`，带一行「按本轮输入检索，可能不完整」。
+
+**预取内容并入既有快照消息，不新开一条。** 代价是重写频率上升；收益是 surface 上**恒为一条**，
+`replace` / 压缩补偿 / `hasSystemHead` 兜底逻辑一行都不用改。这块踩过写坏 16 个真实会话的事故
+（V7.2），不碰它是刻意的。
+
+**变化阈值 + 冷却**（压住 prompt cache 抖动）：
+
+- 命中 id 集合与上轮**完全一致 → 不重写**；
+- 集合变了但距上次换血 `< projectRecallMinRounds` 轮 → 本轮不换；
+- 轮数与 id 集合记在快照自己的 `source.recall = { ids: [], round: n }` 里，**不新增外部状态**。
+
+**轮数计数器的判据（实测钉死，别自作聪明放宽）**：只数
+`type === 'user/message' && source.kind === 'user'`。
+
+- 宿主每轮都会额外写若干条**同样是 `user/message`** 的事件：`runtime-context`、`time-context`、
+  `tool-jobs`、`skill-catalog`。真实日志实测：真用户发言 1–3 条的会话里，这些注入类事件有
+  **3–10 条**。所以用「`user/message` 且不是本插件」当轮数，**一轮之内就能凑满
+  `projectRecallMinRounds=3`，冷却直接失效、预取每轮换血**——这不是理论风险，是实测结果。
+- `source.kind === 'user'` 才是真实轮次。实测样本里它与快照条数一一对应。
+
+**`source` 可以携带自定义键（已实测确认）**：真实日志里本插件事件的 `source` 落盘后完整保留
+`kind / form / digest / truncated / sections / byteSections`，宿主**不做未知键剥离**，自定义
+`kind` 也不受枚举限制。所以 `source.recall` 同样能落盘读回，无需额外存储。
+
+## V8.10 热度统计（`lib/core/usage.js` + `lib/host/usage.js` 新增，B 负责）
+
+落盘在 `<projectRoot>/<projectDirName>/usage.json`：
+
+```json
+{ "topics": { "注入机制": { "hits": 12, "last": "2026-11-10T…" } },
+  "entries": { "a3f2c": { "hits": 3, "last": "…" } } }
+```
+
+- **主键是 `topic`，条目 id 只作辅助。** 条目 id 由 `sha1(time + body)` 派生，整编改写正文后
+  id 就变，靠它做热度必然丢历史；topic 才是稳定锚点。
+- 记录点：`memory search` 命中 + 预取命中。
+- 文件缺失 / 损坏 / 缺字段 → **一律当空统计继续，只 warn 不抛**；热度缺失时排序退回时间倒序。
+- 写失败只 warn。写入防抖：进程内累计，整编时或每 N 次命中才落盘一次。
+- 热度**只影响渲染期排序**，不改盘上 `tier`；真正的 `tier` 变更只在整编时发生（不变量一）。
+
+## V8.11 可观测（`lib/host/routes.js` 归 C，`lib/client.js` / `locale/*.json` 归 D）
+
+`memory` 的 `list`、`GET /doc`、整理报告 `runs.jsonl` 各补：core / cold 条数、主题数、
+三段各自字节、预取命中数、被临时折进目录的条目数。面板加一节分层概览，只用 `--dsw-alias-*`
+token，无 JSX，`lib/client.js` 保持单文件。
+
+**没有这一节，用户无法判断分层到底有没有用，也无法发现"目录涨太快"。** 不属于可裁剪范围。
+
+## V8.12 文件归属表（v8，覆盖 §1 的归属冲突）
+
+| 成员 | 独占写作用域 |
+|---|---|
+| Lead | `docs/CONTRACT.md`、`lib/host/config.js`、跨域裁决与最终验收 |
+| A core-format | `lib/core/document.js`、`lib/core/render.js`、**`lib/core/entry-format.js`**、**`lib/core/topics.js`**、**`lib/core/render-common.js`**、**`lib/core/render-tiered.js`**、**`lib/core/snapshot-tiered.js`**、**`lib/core/tier-index.js`**（后六个为 v8 新建；拆分的直接原因是 WORKER.md 的 400 行上限：`document.js` 拆前 483 行、`render-tiered.js` 拆前 546 行） |
+| B host-inject | `lib/host/inject.js`、`lib/host/tools.js`、**`lib/host/tools-search.js`**、**`lib/host/inject-recall.js`**、`lib/host/usage.js`、`lib/core/usage.js`（v8 新建） |
+| C digest-store | `lib/core/store.js`、`lib/core/consolidate.js`、**`lib/core/consolidate-plan.js`**、`lib/host/digest-input.js`、`lib/host/digest.js`、**`lib/host/digest-prompt.js`**、`lib/host/routes.js`、`lib/host/routes-digest.js`、`lib/host/routes-settings.js` |
+| D client | `lib/client.js`、`locale/en.json`、`locale/zh.json` |
+| B（授权例外） | `test/host-install.test.js` **只限** V8.1.1 的 `byteSections` 键数断言与 V8.15 第 7 条的降级提示行断言，其余一律不许碰 |
+
+### 单一来源纪律（防静默失效，违反不会被测试抓住）
+
+- 主题表围栏字面量**只许出现在 `lib/core/topics.js`**；读写只许走 `parseTopicIndex` /
+  `upsertTopicIndex`，**不许出现第二套解析路径**。成对围栏缺一侧一律当空表，**不猜结尾**。
+  （实测已核：当前 `lib/` 下字面量仅一份，`tools-search.js` 与 `digest.js` 均 import 权威实现。）
+- 条目头正则**只许出现在 `lib/core/entry-format.js`**。
+- 降级提示行按路径各自单一：v7 回滚通道的 `INDEX_HINT` 只在 `render.js`，
+  分层路径的 `COLD_HINT` 只在 `render-tiered.js`。
+
+跨域需求（如 B 要 A 改 `buildProjectSection` 签名）→ 写在完成报告里交 Lead 裁决，**不许自己动手**。
+
+## V8.13 测试归属（v8）
+
+**验收口径统一为 `node --test --test-concurrency=1`**（串行）。原因实测过：默认并发下注入类
+用例会因负载抖动造出 **20+ 条假红**，同一条用例单独跑必绿——各人看到的红名单都不一样，
+无法作为交接依据。加 `duration_ms` 约 6.5 秒，代价可接受。
+
+从仓库根跑，**不要用 `node --test test/`**（本机 Node 24 会把它当模块解析）。
+`test/digest-prompt.test.js` 的红是设计意图，不是误报（踩坑第 6 节）。
+
+**默认值不许在测试里硬编码第三遍。** `resolveConfig` 的默认值已经有 `zod .default()` +
+`DEFAULTS` + `paths-document.test.js` 全默认断言 + 本文件 `*_DEFAULTS` 四处，坑位测试守总数；
+用例内部一律引用 `*_DEFAULTS` 常量，不要再抄数字（v8 改 `projectCoreMaxBytes` 与
+`digestConsolidateMaxOutputTokens` 时，硬编码那处重复红了两次）。
+
+| 测试文件 | 归属 | 守什么 |
+|---|---|---|
+| `document-tier.test.js` | A | 五段头解析、缺省 core、非法值退回、派生 tier 不落盘、往返幂等、`{...entry}` 丢 id/tier 的既有约定不破 |
+| `topics-index.test.js` | A | 围栏解析/生成/插入，preamble 其余内容逐字不变，用户手删围栏后不炸 |
+| `render-tiered.test.js` | A | core/目录预算分配、core 溢出折进目录、`tieredInjection:false` 逐字节退回旧输出、**段级独立降级：project 超预算时 global 正文必须逐字在场** |
+| `search-extended.test.js` | B | 跨 md 检索命中 pitfalls、排除 `history/`、中文长尾召回、**输出 schema 覆盖每一个返回键** |
+| `recall-prefetch.test.js` | B | 无输入跳过、空命中不发标题、id 集合不变不重写、冷却期内不换血、快照仍经 `decision.messages` 由宿主提交 |
+| `usage.test.js` | B | 损坏/缺失当空、topic 计数在条目 id 变更后仍延续、写失败只 warn |
+| `store-project-docs.test.js` | C | 枚举排除 `history/`、目录不存在返回空、排序稳定 |
+| `consolidate-tier.test.js` | C | 三键解析、缺省不动、非法 tier 进 suspects、orphanTopics、落盘顺序 |
+| `client-tier.test.js` | D | 分层概览渲染、`sections` 只剩两键时不崩 |
+
+夹具三条铁律（V7.3 + 踩坑第 8 节，v8 继续适用）：必须复刻宿主的 `decision.messages` 提交动作；
+session 桩必须预置 `system/message` 占 `events[0]`；假数据必须与真实落盘结构完全一致。
+
+## V8.14 边界与失败模式（逐条已定处理方式）
+
+| 情况 | 处理 |
+|---|---|
+| 旧文件无 tier/topic | 视为 core / 未分类，升级后首次注入正文与升级前逐字节一致 |
+| 条目 topic 写了主题表没有的名字 | 摘要用正文首句兜底，别名留空，记 `orphanTopics` |
+| 主题表围栏被用户手删 | 当空表，目录退回条目首句摘要；下次整编自动补回 |
+| core 段超预算 | 渲染期按热度临时折进目录，**不写文件** |
+| 预算小到放不下一行目录 | 保住固定提示行与合法包裹（复用 `fitWrappedIndex` 优先级） |
+| 只有 cold 没有 core | 只出目录 + 提示行，不出空标题 |
+| 段顺序错位（写了 `tier:` 却没写 `id:`） | 整行不认作条目头，退回正文，不错位解析 |
+| `usage.json` 损坏 / 缺失 | 当空统计，warn 一次，排序退回时间倒序 |
+| 读不到用户输入 | 跳过预取，快照其余部分照常 |
+| 预取无命中 | 预取段为空，不发空标题 |
+| 整编模型漏输出 tier/topics | 视为"不动"，条目保持原 tier，主题表不更新 |
+| 整编模型输出非法 tier | 视同没写 + 记 `suspects` |
+| 压缩吞掉快照 | `compactionRecall` 现有重同步不变；预取小节随快照一起重写 |
+| 插件软开关关闭 | 不注入、不预取、不写 usage；旧快照原样保留（v3 语义不变） |
+| `tieredInjection: false` | 逐字退回 v7 渲染路径（回滚通道，必须留） |
+| `docBody` 剥掉主题围栏 | 预期行为：目录由渲染层生成，不让原文透传，否则出现两遍 |
+
+## V8.15 Lead 裁决记录（实现过程中的接口空白，逐条已拍板）
+
+### 1. `recall` 入参形状（补 V8.4 的空白）
+
+```js
+recall: { ids: string[], items: Array<{ id, topic, tier, text, score }> }
+usage:  { topics: {…}, entries: {…} }   // 直接传 usage.json 那个对象
+```
+
+`digest` 只取 `ids`；渲染层只负责把 `items` 画成 `## 本轮相关记忆`。**两条硬要求**：
+
+- `items[].text` 必须走 `escapeFrame` 再拼进快照——预取来的条目正文里只要出现
+  `</supermemory>` 就会提前闭合整个包裹。这是 `escapeFrame` 存在的唯一理由，新路径不许绕过。
+- 条数与总字节由渲染层按 `projectRecallTopK` / `projectRecallMaxBytes` 裁，注入层不预裁。
+
+### 2. 渲染层能力探测（允许，但必须吭声）
+
+`lib/core/render.js` 用命名空间 import + `typeof buildTieredSnapshot === 'function'` 探测，
+A 未就位时逐字退回 v7 `buildSnapshot`——**允许**，它能避免半集成态打爆全量测试。
+
+但探测失败退回 v7 时**必须 `logger.warn` 一次**。理由见 V7.1 的教训：
+**降级只意味着「不抛错」，不意味着「不吭声」**。配了 `tieredInjection: true` 却静默跑在 v7 上，
+是最难排查的一类事故。
+
+`deps.render`（测试注入假渲染层）**允许**：`deps` 是 `lib/index.js` 到装配函数的内部对象，
+不是插件返回值，不违反「插件入口不为测试返回可访问句柄」。登记在此，免得后人当暗桩删掉。
+
+### 3. 预取候选判据（采纳 B 的简化，但补一个洞）
+
+判据定为 `entry.tier !== 'core' || overflowIds.has(entry.id)`。
+
+- 采纳"不做动态剔除 core 已在场"：V8.0 三层定义本就写明 cold 只被 search/预取命中。
+- **但不许写成只看 `tier`**：V8.4 规定 core 段超预算时溢出条目会**临时折进目录**，这些条目
+  `tier` 仍是 `core` 却不在正文里。只按 `tier` 排除，它们就永远回不到正文。
+- `overflowIds` 取自 `buildProjectSection` **已经要返回的 `overflow` 字段**（V8.4），
+  所以**不需要 A 改签名**，零接口变更。
+
+### 4. 轮数计数器判据
+
+见 V8.9 的实测钉死：**只数 `source.kind === 'user'`**。用"非本插件的 user/message 条数"会让
+冷却在一轮内失效。
+
+### 5. 两处语义收口
+
+- `append` 的 `tier` **只对 `scope: 'project'` 生效**，其它 scope 传了直接忽略且**不回错误**
+  （soul/user/global 没有分层语义，收下反而是误导模型）。工具描述里要写明。
+- `usage.json` 的落盘触发定为**两种**：每 N 次命中、以及 dispose。**取消「整编时落盘」**——
+  那需要 C 反向持有 B 的 tracker 实例，跨域耦合换来的收益太小。N 取 8。
+
+### 6. `test/host-install.test.js` 归属补登
+
+V8.1.1 会把该文件里「占位快照 `byteSections` 为四键」的断言打红。该文件此前未登记归属，
+现补登给 **B**：只有注入层最清楚正确形态。**允许 B 改这一处，且只许改这一处相关断言。**
+
+### 7. 降级提示行按路径分断言（`test/host-install.test.js` 超预算那例）
+
+v8.1.2 把降级形态从「全量索引」改成「core 正文 + 主题目录」，固定提示行随之分叉：
+
+- 分层路径 → `COLD_HINT`：`冷层条目用 memory 工具按需检索（action=search, scope=project）。`
+- v7 回滚通道（`tieredInjection: false`）→ `INDEX_HINT`：`完整内容可用 memory 工具按需读取。`
+
+`test/host-install.test.js` 里守旧文案那例必须**按注入路径分别断言，两条覆盖都得留**。
+**禁止用「让两个提示行同时出现」来糊过去**——那等于把回滚通道的文案污染进分层路径，
+两条契约同时被稀释。
+
+### 8. 条目头「缺段即整行不认」的收窄（批准，属契约内部冲突的修正）
+
+契约 V8.2 与 V8.14 按字面执行会互相打架：`renderEntry` 最常见的输出正是
+`- … · id:x · topic:主题`（core 条目带主题、而 core **按规则不写 tier 段**），
+严格「缺段即整行不认」会让这行解析不回来——**整编器给条目打主题反而把条目抹掉**。
+
+定稿：**`id` 是 `tier` / `topic` 的前提**（缺 `id` 却写这两段 → 整行不认，V8.14 举的例子照旧守住）；
+**有 `id` 时 `tier` 与 `topic` 各自独立可选**。
+
+### 9. `renderEntry` 补派生 id 的例外（批准）
+
+要写 `tier` / `topic` 却没有可写 id 时，补一个派生 id——否则该行整行不认、条目凭空消失。
+不写这两段的普通条目照旧一个 id 都不补，v4「派生 id 不落盘」的约定不变。
+这条同时保护了 C 的落盘路径。
+
+### 10. 极端预算下允许超出总预算（批准）
+
+`global` 逐字在场、`</supermemory>` 包裹合法，两者都**优先于** `injectMaxBytes`。
+因此 global 自己就超预算时快照会超出总额。收敛顺序固定为：
+全量 → 重算 project 预算（core / 目录三七开）→ 逐条砍主题 → project 段只剩固定提示行。
+**宁可整段超出，也不做会切断 `</supermemory>` 的字节截断。**
+
+### 11. `buildProjectSection.text` 的返回口径（接线必读）
+
+返回的 `text` 是**不含段标题的正文**，从第一条条目直接开始；段标题由快照装配层加。
+`text === ''` 表示**该段什么都不注入**，下游按空串判，不要发空标题或空包裹。
+分层结果里 core/cold/overflow 等统计一律在 `buildTieredSnapshot` 的 `stats` 里取。
+
+### 12. 热度接线必须用 `load()`，不许用 `peek()`
+
+`lib/index.js` 的 `deps.topicUsage` 已接上（形状 `({ projectRoot }) => Array<{ name, hits }>`）。
+
+**必须 `load()`**：`peek()` 只看内存态，而整编很可能在插件刚启动、或由 `/memory-digest`
+手动触发时跑——那时该项目的分片还没被 search / 预取加载过，`peek` 返回空统计，
+**晋升降级回路静默失效且没有任何报错**。`load()` 走队列读盘，加载过一次即复用。
+
+`options` 三处（index / inject / tools）必须一致（`{ docPathRef: store.docPath, logger }`），
+共用 `getSharedUsageStore` 的同一单例；各自持有内存态会互相覆盖同一个 `usage.json`。
+
+### 13. `digestConsolidateMaxOutputTokens` 6000 → 12000（批准 C 的实测推算）
+
+按 pitfalls §5 实测：两键整编正文 ≈1683 字节（400~600 token）+ reasoning ≈5942 token
+≈ **6.4k，三键之前 6000 就已经被吃穿**。症状正是「正文写完了却因 `finish_reason=length`
+拒绝落盘」。三键的主题表最坏约 24 条 ×72 字 ≈ 1.2~1.7k，合计 ≈8.2k，取 12000 留 1.45× 余量。
+
+**给本地推理模型配输出预算时一律按 reasoning tokens 计，不许按正文长度估。**
+
+### 14. C 的自决点全部批准，其中两条升为契约要求
+
+- **本轮没给出任何主题就完全不碰围栏**——因为 `upsertTopicIndex(text, [])` 会删围栏，
+  照 V8.14「漏输出 topics 视为不动」的语义必须跳过写入。**这是整条链上最容易丢数据的一点。**
+- **主题表硬上限 `TOPIC_LIST_MAX = 50`**——模型报 300 个主题会把下一轮输入吃成
+  `INPUT_OVERFLOW`，盘上必须有闸门。
+- `listProjectDocs` 每项带绝对 `path`：批准。让调用方自己拼路径等于把可配置的
+  `projectDirName` 复制一遍。
+- `parseConsolidateOutput` 多返回 `invalidTiers`：批准。非法 tier 在归整那刻就被丢掉，
+  不透出就再也还原不出「模型写错了什么」。
+- 主题名 / tier 判据一律复用 `entry-format.js`：批准，属单一来源纪律。
+- `summary: 42` → `''`、`aliases: "a, b"` → `['a','b']`：批准。
+- **`GET /doc` 的注入口径拿不到就省略字段，不许报 0**——0 会被面板读成「一个字节都没注入」。
+
+### 15. 面板降级约定（D 必读）
+
+- runs.jsonl 的 `consolidation`（含 `tiers` / `topics` / `orphanTopics` / `invalidTiers`）
+  **只在 consolidate 轮存在**；追加模式的 run 没有分层统计，不许假设每条 run 都有。
+- `tiering` 里盘上事实（`core` / `cold` / `topics` / `docBytes`）恒给；
+  注入口径（`injectedCore` / `hiddenCold` / `overflowIds` / `totalBytes` / `coreBytes` /
+  `indexBytes`）可能整个缺席，必须缺字段降级。
+
+### 16. `recall` 的实际形状是**条目数组**，V8.15 第 1 条作废
+
+第 1 条写的 `{ ids, items }` 与 `buildRecallSection` 的落地实现（`Array.isArray(recall) ? recall : []`）
+不一致。**若按对象传，`Array.isArray` 为 false → 静默返回空数组 → 预取小节永远不出现且不报错**。
+定稿以落地实现为准：
+
+```js
+recall: Array<{ id, topic, tier, body, score }>   // 条目数组；无候选传 []
+```
+
+- 渲染层需要 id 集合时从数组元素自取，注入层不再单独传 `ids`。
+- 渲染层收到**非数组**时必须 `logger.warn` 一次（形状误用属编程错误，不许静默变空）。
+- 新增用例：传对象 / 传 null 时不得静默产出空小节而不吭声。
+
+### 17. `entryLocator` 登记（B 的新接口）
+
+`lib/host/tools-search.js` 导出，形状 `entryLocator(text) → { entryAt(line), entries }`：
+
+- `entries: Array<{ line, id, tier, topic, time, body }>`，顺序即文档顺序，`line` 是条目头
+  在文档里的 1-based 行号。
+- 头行数与 `parseEntries` 条数不等时**只取 `min(两者)`**——解析器与渲染器版本错配时宁可少给，
+  不要错位返回。
+- `entryAt(line)` 二分查「最后一个头行号 ≤ line」的条目；落在前言区（标题、主题围栏、
+  `## 条目` 之前）返回 `undefined`。
+- 唯一消费者是 `searchProjectDocs`：拿命中行号反查所在条目，补出 `file` / `id` / `tier` / `topic`。
+
+归属 B，测试归 `test/search-extended.test.js`。
+
+### 23. `append` 只提供 `tier`，**不提供 `topic` 参数**
+
+主题表是目录，**目录的价值在于收敛**。让写入方自由命名主题，同一件事必然出现
+「注入机制 / 快照注入 / inject 通道」三个名字，后果不是难看而是**可测量的功能损失**：
+C 已查明「整编换了主题名」是**热度断链的唯一成因**（`entryHeat()` 靠 `max(entryHits, topicHits)`
+经 topic 接续，名字一换旧热度全成孤儿），目录同时会爆炸式膨胀并吃掉整编输入。
+
+只有整编器有归并所需的**全量视图**（盘上主题表已喂进它的输入），写入方没有。
+所以 `memory append` 不收 `topic`；`DESCRIPTION` 里写明「条目可带 topic，主题表由整理器维护，
+你不用传」是**正确措辞，不是遗漏**。
+
+将来若真要开放给模型，必须先有闸门：只能匹配盘上已有主题名，匹配不上就归未分类，
+不许凭空造名。
+
+### 24. 面板不显示预取命中数与 recall 段字节（V8.11 该项作废）
+
+D 提出面板拿不到 `recallCount` / `recallBytes`（渲染层 `stats` 里有，但既不进快照 `source`、
+`GET /doc` 也没有）。**裁决：从面板要求里划掉，不补字段。**
+
+理由不是"做不到"，是**这类字段的性质不对**：
+
+- `recall` 是**瞬时状态**——它属于"某一次 pre-step 的那一轮"。用户点开面板时看到的数字属于哪一轮？
+  无法回答。C 已经拒绝过把 runs 里的旧报告混进 `tiering`（会让两份不同时刻的数据看起来像同一时刻），
+  往同一个对象里再塞一个每轮变化的值是同一个错误的更严重版本。
+- 用户真正想知道的"本轮注入了哪些记忆"，**在注入文本里直接可见**——就是那个
+  `## 本轮相关记忆` 小节本身。面板再显示一个数字是重复信息，还多一处会漂移的口径。
+- 今天全队最贵的教训就是**同一件事有两套口径**。为一个排查便利的数字再加一处，不划算。
+
+**要观测预取的正确途径**：读注入文本里的 `## 本轮相关记忆` 小节，或离线跑
+`buildTieredSnapshot({ recall: pickRecallItems(...) })` 看 `stats`。将来若确有长期观测需求，
+正确形态是独立的"最近一次注入"观测面（带轮次时间戳），**不要塞进 `tiering`**。
+
+### 25. 快照落盘形态实测（读日志前必看，Lead 自己踩过误判）
+
+实测自真实会话日志（`session.v4.jsonl.zstd`，只读解压）：
+
+```
+事件顶层 = { type, seq, time, data, sourceEventSeqs, surfaceOp }
+data.source = { kind, form, digest, truncated, sections, byteSections, recall? }
+                                        ↑ 数组          ↑ 对象
+sections: [{ name: 'global', text: '…' }, { name: 'project', text: '…' }]
+```
+
+- `sections` 是**数组**，元素字段名是 `name`；取项目段要 `sections.find(s => s.name === 'project')`，
+  **`sections.project` 是 `undefined`**。`byteSections` 才是对象，分层后只有 `global`/`project` 两键。
+- replace 信息在**顶层 `surfaceOp`**，不在 `data` 里：`surfaceOp: { op: 'replace', startSeq, endSeq }`。
+  **读错这一处会把完全正常的会话误判成「恒一条防线失效」**——Lead 按 `data.op` 读时，
+  曾看到"7 条快照全 append、同 digest 写两次"并差点上报事故。
+- `recall` 键在**没有预取候选时整个缺席**（不是空对象）。本项目记忆全是 core，
+  判据 `tier !== 'core' || overflowIds.has(id)` 全不成立 → 无候选 → 省略键，
+  这是**正确行为**，不要当成"预取坏了"。
+- 压缩之后那条快照用 `append` 重建（原节点已被摘走、没有可 replace 的目标），
+  所以**同一 digest 出现两条是预期**，不是"不变不写"失效。实测：seq 14 append →
+  seq 454 `replace(14~14)` → 压缩遮蔽 12~271 → seq 763 `append`（digest 与 454 相同）→
+  此后 4 条连续 `replace`，防线成立。
+
+### 26. 过滤遮蔽事件只许按 `shadowedSeqs`，**`shadowedRange` 不是集合**
+
+真实日志实测（29 个会话逐行核对）：
+
+- 一条 summary 的 `shadowedRange = {start:10, end:217}`，而它的 `shadowedSeqs` **只有 80 个**
+  ——range 是**包络**，中间 128 个事件从未被摘要。
+- 另一条 `shadowedRange = {start:556, end:657}`，而 `shadowedSeqs` 里出现了 **220**，
+  比它自己的 `range.start` 还小——**两个字段各说各话**。
+
+**按 range 展开删除，会把从没被摘要过的真实对话踢出整编输入，而摘要里也没有它们——
+这是唯一会造成不可逆丢失的写法。** 用例专门摆出「range 比 seqs 宽」的形状守住这条：
+range 覆盖到、但不在 `seqs` 里的事件**必须保留**。
+
+配套规则：`seq` 读不到时（旧宿主、测试替身）**一律保留**，判断不了就宁可多读；
+`compaction/summary` 与 `compaction/prune` **两种都要收**，只认 summary 会漏掉 prune 遮蔽的那批。
+
+### 27. 两条被实测推翻的假设（留此防止重复提出）
+
+- **「整编输入会因遮蔽事件多读一到两个数量级」不成立。** `collectTranscript` 只取尾部 40 条，
+  尾部被遮蔽的实测 **0 条**（窗口放宽到 60 也只有 1 条）。原因：压缩遮蔽的永远是窗口**头部**
+  的旧内容，尾部正是压缩之后新产生的对话。
+  **过滤仍然要做，但理由是质量**：已被摘要压过的旧原文再进整编，模型会把它当「现在的事实」
+  重述一遍，落进过时条目。**注释里不许写「防膨胀」**——错误的理由会诱导下一个人关掉它。
+- **「输入里同时有旧原文和它的摘要」不会出现。** `collectTranscript` 只收 `user/message` 与
+  `assistant/message`，`compaction/summary` 不是消息类型，**摘要进不了 transcript**；
+  所以也无法用摘要去重，只能靠 `shadowedSeqs` 集合。
+
+### 18. `bytes` 口径：唯一形状 `bytes: { total, core, index }`
+
+三个都是数字，口径由渲染层定义、消费方不得自行兼容：
+
+| 键 | 含义 |
+|---|---|
+| `core` | core 条目正文部分的字节 |
+| `index` | 主题目录段字节（含 `### 主题目录` 标题行与挤出组）；**无目录时为 0** |
+| `total` | 整个 project 段正文 = core + 目录 + 冷层提示行 + 段间空行；**不含**段标题 `## …` 与 `<supermemory>` 包裹 |
+
+恒有 `total >= core + index`，差值是空行与提示行，不是丢字节。由
+`describe('bytes 口径')` 三档场景钉死，含 `total === byteLength(text)` 硬等式。
+
+**消费方禁止写兼容读取**（`typeof b === 'number' ? b : b.core` 这类）——兼容读取会把口径分歧
+永久藏起来，面板与 list 各猜一半，出错时无人知道哪边错。
+
+### 18.1 一条被纠正的错误归因（留此防误导）
+
+曾推测「把 `projectCoreMaxBytes` 从 8192 提到 16384 会打坏渲染夹具的期望」，**该结论不成立**：
+渲染层测试一律**显式传预算**、不吃默认值，改默认值对其零影响。那两例红的真实原因是
+改目录规则时留下的旧断言。
+
+**由此定下的规矩**：调 `projectCoreMaxBytes` / `projectIndexMaxBytes` 默认值时，需要同步的只有
+配置侧那四处断言（见 V8.13），**不需要**去改渲染层夹具；反过来，渲染层用例也不许改成吃默认预算，
+否则这条规矩就失效了。
+
+### 19. 预取的两处口径（批准 B）
+
+- **`source.recall.ids` 为空时整个键省略**：否则首轮无命中的会话要白等 `projectRecallMinRounds`
+  轮才出第一次预取。
+- **冷却不换血时照常按旧 ids 回填正文**，不复用旧文本。否则只要别的段变化触发快照重写，
+  预取小节就凭空消失，表现为「记忆每轮掉一截」。
+- usage 只在**真换血**时记，冷却期内重复命中不重复计数。
+
+### 20. 追认 v8 新增文件（均已在 V8.12 登记）
+
+`lib/core/tier-index.js`（A，目录呈现改造）、`lib/host/inject-recall.js`（B，预取判据纯函数
+247 行）、`lib/host/tools-search.js`（B，跨 md 检索 + 枚举 + `entryLocator` 368 行）。
+拆分的共同理由是装配本体已 700+ 行且判据必须能单独测；**不合并回去**。
+
+### 21. 整编 × 预取的已知交互（真机验收必查）
+
+整编重写正文 → 条目 id 换代 → 快照里旧 `recall.ids` 整批失效 → **下一轮必然换血**。
+热度账以 topic 为主键可缓解（id 会变、topic 稳定），但「整编后第一次注入把预取整批换掉」
+尚无夹具覆盖。验收要确认它不会撞上 V8.14 的抖动防线，也不该被当成 bug 修掉。
+
+**确切机制（C 从实现里核出，验收时照此判断，别凭直觉误判成 bug）**：
+
+1. **换代是必然的，与正文有没有变无关**。`applyConsolidation` 造新条目时 `time` 取**整编时刻**，
+   不继承被吸收条目的时间，也不带 `explicitId`；派生 id = `deriveEntryId(time, body)`。
+   所以**模型把正文一字不改地重述，id 也一样换**。真机上最容易骗人的一条就是
+   「正文没动，id 怎么变了」——这是设计行为，不是缺陷。
+2. **换代是局部的**：只有被 `entries[].from` 提到的条目换 id，未提及的条目逐字节原样保留。
+   而模型倾向合并内容扎实的事实，**恰好就是被检索得最多的那几条**，所以换血集中命中预取。
+3. **热度断链的唯一情形是整编同时换了主题名**。`usage.json` 的 `entries` 键是条目 id，
+   换代后旧键全成孤儿（不删，`usageSummary().entries` 只增不减）、新 id 从零起步；
+   但 `entryHeat()` 取 `max(entryHits, topicHits)`，**只要主题名没变，热度就经 topic 接得回去**。
+   风险集中在模型给同一件事起了第二个主题名。
+4. **不用猜的信号：`runs.jsonl` 里该轮 `consolidation.orphanTopics` 非空 = 主题表里出现了
+   没人用的名字**，配合该条目的 `topic` 新名即可确认热度断链确实发生，无需比对两份 usage.json。
+   验收时每轮都该看一眼这个字段。
+
+### 22. 整编输入的热度必须全量，不许只给前 10
+
+`usageSummary().hottest` 是 `rows.slice(0, 10)`。盘上主题超过 10 个时，第 11 名往后的主题
+在整编输入里「没有数字」，模型就有实锤机会把**还有热度、只是没进前 10** 的主题判成冷门
+降进冷层——**而降级不可逆**：降下去之后它只出现在冷层检索里，用户更难发现。
+
+定稿（区分用途，不让一个函数迁就两个消费者）：
+
+- `usageSummary(usage)` 额外返回 **`topicRows`**：全部主题、按 hits 降序、元素 `{name, hits, last}`。
+- **`hottest` 保持 top-10 不变**，它是面板用的热点视图。
+- `deps.topicUsage`（`lib/index.js`）取 **`topicRows`**，不取 `hottest`。
+- 体积无需担心：主题数已被 `TOPIC_LIST_MAX = 50` 闸住，50 行热度约 1.5 KB，
+  而整编输入闸门是 120 000 字节且明令「不新增截断」。
+
+整编输入里那一节的小标题措辞**必须说「没有数字表示这一轮没拿到它的命中数，不等于零命中」**，
+不许简化回「没有数字表示还没有统计」（在前 10 截断下那句不成立，即便本条已修也留着当防线）。

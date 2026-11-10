@@ -1,6 +1,11 @@
 # 本地自测依赖（Lead 从 profile 复制，仅用于 node --test 解析 @deepseek-ai/schemastery）
 node_modules/
 
+# 测试代码只在本地维护，不进仓库。
+# 注意：gitignore 只对未被跟踪的文件生效，历史上已提交过的 test/ 需要
+# `git rm --cached -r test/` 才会从索引里摘掉，而它们在旧提交里依然存在。
+test/
+
 # 运行期产生的记忆数据不应进仓库
 .dsh/
 
