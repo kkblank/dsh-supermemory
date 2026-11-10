@@ -411,17 +411,6 @@ function makeSession(id, options = {}) {
     snapshotEvents() {
       return events.slice()
     },
-    /** 模拟宿主在后续 step 写出 system/message，即受保护头部落地。 */
-    seedSystemHead() {
-      const seq = events.length
-      events.push({
-        type: 'system/message',
-        seq,
-        data: { role: 'system', content: [{ type: 'text', text: 'system prompt' }] },
-      })
-      nodes.push(seq)
-      return seq
-    },
     append(type, data, opts) {
       const seq = events.length
       const op = opts?.surfaceOp
@@ -511,12 +500,26 @@ async function makeInjectionHarness(options = {}) {
   }
   const seed = (kind, body, time = '2026-11-10T00:00:00.000Z') =>
     store.appendEntries(refs[kind], [{ time, source: 'user-request', body }])
-  const runPreStep = () =>
-    ctx.waterfall(
+  /**
+   * 触发一次 pre-step，并**复刻宿主的提交动作**：`dsh-agent-loop` 在 append 完
+   * system/message 之后、构造请求之前，会把 `decision.messages` 里非 runtime-context
+   * 的消息逐条 `session.append('user/message', ..., { surfaceOp: 'append' })`。
+   * 插件把首次快照交给这条通道，所以夹具不模拟它就看不到快照落到 surface。
+   * @param {{ commit?: boolean }} [opts] - `commit: false` 只看插件返回了什么，
+   *   不落盘——用于证明插件没有自己 append。
+   * @returns {Promise<object>} pre-step 的 decision。
+   */
+  const runPreStep = async (opts = {}) => {
+    const decision = await ctx.waterfall(
       'agent/pre-step',
       { agent: { session }, messages: [], step: 1, signal: { aborted: false } },
       () => ({ kind: 'enter', messages: [], startsRequestSeries: true }),
     )
+    if (opts.commit !== false && Array.isArray(decision?.messages)) {
+      for (const message of decision.messages) session.append('user/message', message, { surfaceOp: 'append' })
+    }
+    return decision
+  }
   const cleanup = async () => {
     try {
       dispose()
@@ -555,19 +558,41 @@ test('首次 pre-step：恰好追加 1 条快照，source 结构与首行提示�
   assert.ok(text.includes('喜欢深色主题'))
 })
 
-test('受保护头部未落地：pre-step 一个字都不写（抢跑一次就把整个会话永久写坏）', async (t) => {
+test('首次注入交给宿主落盘：插件绝不自己 append（自己写必然抢跑）', async (t) => {
+  const h = await makeInjectionHarness()
+  t.after(h.cleanup)
+  await h.seed('global', '喜欢深色主题')
+
+  const decision = await h.runPreStep({ commit: false })
+  assert.equal(h.session.allPluginEvents().length, 0, '插件自己 append 就会抢在 system/message 之前，把会话永久写坏')
+  const mine = (decision.messages ?? []).filter((m) => m?.source?.kind === 'dsh-supermemory')
+  assert.equal(mine.length, 1, '快照必须放进 decision.messages 交给宿主')
+  assert.ok(mine[0]?.content?.[0]?.text?.startsWith(SNAPSHOT_NOTICE), '交给宿主的仍是合规快照')
+
+  // 宿主按自己的时机落盘之后，surface 上恰好一条。
+  for (const message of decision.messages) h.session.append('user/message', message, { surfaceOp: 'append' })
+  assert.equal(h.session.pluginSnapshots().length, 1)
+})
+
+test('replace 兜底：历史里没有 system/message 时跳过替换并留下告警', async (t) => {
   const h = await makeInjectionHarness({ systemHead: false })
   t.after(h.cleanup)
   await h.seed('global', '喜欢深色主题')
 
-  await h.runPreStep()
-  assert.equal(h.session.allPluginEvents().length, 0, '宿主还没写 system/message，一条快照都不许落盘')
-  assert.equal(h.session.surface.nodes.length, 0, 'surface 的第一个位置必须留给宿主的 system/message')
+  // 手工落盘造出「快照已在、受保护头部却不在」的越界形态——正常路径出不出来，
+  // 正因如此这道兜底才需要有人替它站岗。
+  const first = await h.runPreStep({ commit: false })
+  for (const message of first.messages) h.session.append('user/message', message, { surfaceOp: 'append' })
+  assert.equal(h.session.pluginSnapshots().length, 1)
 
-  // 头部落地后，同一个会话下一轮照常补上——门控只是延后一轮，不会造成永久失忆。
-  h.session.seedSystemHead()
+  await h.seed('global', '再记一条，让 digest 变化')
+  const nodesBefore = h.session.surface.nodes.slice()
   await h.runPreStep()
-  assert.equal(h.session.pluginSnapshots().length, 1, '头部落地后必须补注入')
+  assert.deepEqual(h.session.surface.nodes, nodesBefore, '越界形态下 surface 必须原样不动')
+  assert.ok(
+    h.ctx.warnings.some((w) => /system\/message/.test(String(w))),
+    '跳过替换必须留下告警，静默等于把问题埋掉',
+  )
 })
 
 test('hasSystemHead：读不到日志一律判 false（宁可不写，也不写坏会话）', () => {

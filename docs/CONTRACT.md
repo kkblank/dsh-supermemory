@@ -1792,27 +1792,43 @@ cordis 的 `ctx.get(name)` 只返回 provider fiber 当前 active 的实现；�
 `installRoutes` 拿不到 webServer 时必须留一条 warn。**降级只意味着「不抛错」，不意味着
 「不吭声」**——静默正是这次事故藏了一整天的地方。
 
-## V7.2 快照绝不允许抢在受保护头部之前落盘（`lib/host/inject.js`）
+## V7.2 快照必须经宿主的 `decision.messages` 落盘（`lib/host/inject.js`）
 
 宿主 v4 日志的硬不变量（`dsh-session-format-v3-to-v4` 的 `foldSurface`）：**surface 的第一
 条记录必须是 `system/message`**，它被登记为「受保护头部」，其后任何 replace 都不许遮蔽它。
 违反的代价不是当轮报错，而是这个会话**此后每次加载都报**
-`system/message requires a protected first surface head`，无法自愈。
+`system/message requires a protected first surface head`，无法自愈——一次真实环境里 40 个
+会话中招 16 个。
 
-宿主写 `system/message` 的时机在 step **内部**，而快照挂在 `agent/pre-step`，天然更早
-（实测相差约 5 毫秒）。谁先落地取决于异步快慢，是竞态——一次真实环境里 40 个会话中招 16 个。
+抢跑不是运气，是必然：`dsh-agent-loop` 里 `agent/pre-step` 在 685 行，`step/start` 757 行，
+`system/message` 854 行。插件挂在 pre-step 上自己 `session.append`，天生比宿主早两道工序
+（实测约 5 毫秒）。
 
-守则：pre-step 里 `hasSystemHead(session)` 为 false 时**一个字都不写**，直接放行 `next`。
-判据必须用 append-only 的 `snapshotEvents()`，不能用 `surface.nodes`——压缩会把整段区间从
-surface 上抹掉，用它会在压缩之后把注入永久卡死。已有过快照时 `system/message` 必然早已
-写过，门控自动放行，不影响压缩补偿重写。
+**首次注入不许自己 append**：把快照放进 pre-step 返回值的 `messages` 里交给宿主。loop 在
+append 完 `system/message` 之后、构造请求之前，会把其中非 `runtime-context` 的消息逐条
+`session.append('user/message', message, { surfaceOp: 'append' })`——时序由宿主保证，本轮
+就可见；后续更新仍用 `surfaceOp: replace` 维持「历史里恒为一条」。追加只能加在尾部，不得
+覆盖或重排上游已放进 `messages` 的消息。
+
+**不要退回「头部没落地就整轮不写」的门控**：那样单轮短会话（用户问一句就走）整轮都在让路，
+结果是完全拿不到记忆——这条路实测已经废掉过一条真实会话的注入。`replaceSnapshot` 里保留
+`hasSystemHead` 只作兜底：判据用 append-only 的 `snapshotEvents()`，不能用 `surface.nodes`
+（压缩会把整段区间从 surface 上抹掉，用后者会在压缩之后把注入永久卡死）；真走到兜底说明
+历史形态已超出假设，这一轮宁可不更新并留一条 warn，也绝不碰 surface 的第一个位置。
 
 ## V7.3 测试归属
 
-- `injection-trigger.test.js`：头部未落地时零写入、头部落地后补注入；`hasSystemHead` 的
-  四种读不到日志的入口一律判 false。三个 session 桩默认预置一条 `system/message`
-  占 `events[0]`——**桩不带它，就是在宿主不可能存在的形态里测试**；
-  `makeSession(id, { systemHead: false })` 只给专测门控的那条用例用。
+- 三个夹具（`injection-trigger` / `host-install` / `compaction-recall`）**必须复刻宿主的提交
+  动作**：拿到 pre-step 的 decision 后，把 `decision.messages` 逐条
+  `session.append('user/message', ..., { surfaceOp: 'append' })`。不模拟这一步，快照就永远
+  落不到 surface 上，测试等于在一个宿主不存在的形态里跑。
+- `host-install.test.js` 原先守的是「监听器绝不修改 `decision.messages`」，v7 把这条通道改成
+  注入的正道之后断言随之反转（恰好追加一条 `dsh-supermemory`），并另加一条守「只能追加、
+  不得覆盖别人的消息」。这是契约变了，不是放宽守网。
+- `runPreStep({ commit: false })` 只看插件返回了什么、不落盘，用来证明插件没有自己 append。
+- session 桩默认预置一条 `system/message` 占 `events[0]`（宿主在第一个 step 就写它，桩不带
+  就是假形态）；`makeSession(id, { systemHead: false })` 只给测 `replaceSnapshot` 兜底那条用。
+- `hasSystemHead` 的四种读不到日志的入口一律判 false。
 - `routes.test.js`：webServer 缺失必须「不抛错 + 恰好一条 warn」；走注入（`ctx.webServer`
   而非 `ctx.get`）也要能注册满 7 条。
 - 序号一律取 `append` 的返回值，不硬编码数字：夹具预置事件会让 seq 位移，写死只会在夹具

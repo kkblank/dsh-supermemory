@@ -215,12 +215,19 @@ function makeHarness(options = {}) {
   }
   const agent = { session, options: {} }
   const dispose = installInjection(ctx, deps)
-  const runPreStep = () =>
-    ctx.waterfall('agent/pre-step', { agent, messages: [], step: 1, signal: { aborted: false } }, () => ({
-      kind: 'enter',
-      messages: [],
-      startsRequestSeries: true,
-    }))
+  const runPreStep = async () => {
+    const decision = await ctx.waterfall(
+      'agent/pre-step',
+      { agent, messages: [], step: 1, signal: { aborted: false } },
+      () => ({ kind: 'enter', messages: [], startsRequestSeries: true }),
+    )
+    // 复刻 dsh-agent-loop 的提交：decision.messages 里非 runtime-context 的消息由宿主
+    // 在 append 完 system/message 之后逐条落盘。插件的首次快照走的就是这条通道。
+    if (Array.isArray(decision?.messages)) {
+      for (const message of decision.messages) session.append('user/message', message, { surfaceOp: 'append' })
+    }
+    return decision
+  }
   return { ctx, session, agent, runPreStep, dispose }
 }
 

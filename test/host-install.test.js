@@ -364,7 +364,12 @@ async function makeHarness(options = {}) {
   }
 }
 
-/** 跑一次 pre-step，返回 decision。 */
+/**
+ * 跑一次 pre-step，并**复刻宿主的提交动作**：`dsh-agent-loop` 在 append 完
+ * system/message 之后、构造请求之前，会把 `decision.messages` 里非 runtime-context 的
+ * 消息逐条 `session.append('user/message', ..., { surfaceOp: 'append' })`。插件把首次
+ * 快照交给这条通道，所以夹具不模拟它就看不到快照落到 surface。
+ */
 async function runPreStep(ctx, agent, extra = {}) {
   const decision = {
     kind: 'enter',
@@ -372,11 +377,16 @@ async function runPreStep(ctx, agent, extra = {}) {
     startsRequestSeries: true,
     ...extra,
   }
-  return ctx.waterfall(
+  const result = await ctx.waterfall(
     'agent/pre-step',
     { agent, messages: [], step: 1, signal: { aborted: false } },
     () => decision,
   )
+  const session = agent?.session
+  if (session !== undefined && session !== null && Array.isArray(result?.messages)) {
+    for (const message of result.messages) session.append('user/message', message, { surfaceOp: 'append' })
+  }
+  return result
 }
 
 // ——————————————————————————————————————————————
@@ -397,8 +407,10 @@ test('pre-step 首次注入：surface 上恰好一条快照，source 结构符�
 
   const decision = await runPreStep(h.ctx, h.agent)
 
-  // 监听器绝不修改 decision.messages，也不破坏 startsRequestSeries。
-  assert.deepEqual(decision.messages, [])
+  // 首次快照经 decision.messages 交给宿主落盘（自己 append 必然抢在 system/message
+  // 之前，把会话永久写坏，见 docs/CONTRACT.md §V7.2）；同时不得动 startsRequestSeries。
+  assert.equal(decision.messages.length, 1)
+  assert.equal(decision.messages[0]?.source?.kind, 'dsh-supermemory')
   assert.equal(decision.startsRequestSeries, true)
 
   const snapshots = h.session.pluginSnapshots()
@@ -417,6 +429,31 @@ test('pre-step 首次注入：surface 上恰好一条快照，source 结构符�
   const text = data.content[0].text
   assert.ok(text.startsWith(SNAPSHOT_NOTICE))
   assert.ok(text.includes('喜欢深色主题'))
+})
+
+test('pre-step 是追加不是覆盖：别人放进 decision.messages 的消息必须原样保留', async (t) => {
+  const h = await makeHarness()
+  t.after(h.cleanup)
+  await h.store.appendEntries(
+    { kind: 'global', presetId: 'default' },
+    [{ time: '2026-11-10T10:00:00.000Z', source: 'user-request', body: '喜欢深色主题' }],
+  )
+  const dispose = installInjection(h.ctx, h.deps)
+  t.after(dispose)
+
+  // 上游插件或宿主自己可能已经往 messages 里塞了消息，我们只能追加在尾部——这条通道
+  // 是我们新用来落快照的，覆盖别人的消息等于替宿主丢输入。
+  const theirs = {
+    id: 'theirs-1',
+    role: 'user',
+    content: [{ type: 'text', text: '别的插件先塞进来的消息' }],
+    source: { kind: 'someone-else' },
+  }
+  const decision = await runPreStep(h.ctx, h.agent, { messages: [theirs] })
+
+  assert.deepEqual(decision.messages.slice(0, -1), [theirs], '不得覆盖或重排别人的消息')
+  assert.equal(decision.messages.at(-1)?.source?.kind, 'dsh-supermemory', '快照追加在尾部')
+  assert.equal(h.session.pluginSnapshots().length, 1, '经宿主通道同样要落到 surface 上')
 })
 
 test('pre-step 内容未变：不追加、不 replace', async (t) => {
