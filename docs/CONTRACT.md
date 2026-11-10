@@ -810,6 +810,7 @@ writeSettings(patch) -> Promise<{ ok:true, settings } | { ok:false, code, messag
 
 - `DIGEST_SYSTEM_PROMPT` 改为只要求输出 `{"project":["..."]}`，并明确：
   「不要输出 soul/user/global；人格与画像/全局记忆由用户手动维护。」
+  （自 §V3.9 起该提示词同时携带记忆条目的事实性守则。）
 - 解析后**只写 project**。`soul`/`user`/`global` 无论模型输出什么都不写。
   用配置 `digestWritableScopes`（默认 `['project']`）表达，便于将来扩展，但默认只 project。
 - `RunRecord.counts` 仍保留四个 key，非 project 恒为 0。
@@ -1140,3 +1141,26 @@ if (deps.isEnabled?.() === false) return decision
 
 **基线**：344 个用例全绿（v3 的 304 + `search.test.js` 23 + `compaction-recall.test.js`
 10 + 子代理默认值 5）。既有用例只允许改期望值，不许删。
+
+## V3.9 记忆条目的事实性守则
+
+写入记忆的每条只描述**当前为真**的状态，像在写一份今天的说明书，不记录抵达这里的过程。
+
+- **不记变更史**：不写「原先是 A，后改为 B」「已从 X 迁移到 Y」「v2 起…」，也不写数量前后对比——直接写当前结论（「测试基线是 344 个用例」）。
+- **不记未来规划**：计划、待办、下一步、将来可以、尚未实现，一律不写。
+- **允许因果，但仅限帮后来者避开现行陷阱的因果**：「不要用 `node --test test/`，本机 Node 24 会把它当模块解析」可写；「之所以拆成 7 个文件，是因为原先 `routes.js` 太长」这类修改动机不写。
+- **与现有记忆冲突时输出当前结论本身**，不写成「X 已改为 Y」的对比句。
+- **自测**：一年后读到这条，它还成立吗？不成立就别写。
+
+守则有两个生效出口，语义同一套，文案各自语言：整理器的 system 提示词
+`lib/host/digest-input.js` 的 `DIGEST_SYSTEM_PROMPT`（中文）与 `memory` 工具描述
+`lib/host/tools.js` 的 `DESCRIPTION`（英文，`FACTUAL STYLE:` 那一项）。
+
+既有约束不变：`soul`/`user`/`global` 永不自动写（§V2.3）、soul 手动写仍需 `confirmSoul: true`
+（§V2.5）。整理器写回仍是追加（append-only），新条目与旧条目的冲突由后续整理收敛——本守则
+只约束新写入，未引入改写或删除既有条目的能力。
+
+**基线**：350 个用例全绿，其中 `test/digest-prompt.test.js` 6 例守护本节文案——断言取「包含关键
+片段」式，改标点不红，删守则或弱化它必红；另有一例要求被禁措辞（计划、原先、后改为…）只能
+出现在带否定线索的行里，防止提示词自相矛盾，**新增正面使用这些词的规则时需同步改该用例，这是
+设计意图而非误报**。整理器 system 提示当前 881 字符（UTF-8 2163 字节）。
