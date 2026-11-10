@@ -187,6 +187,68 @@ function makeCtx() {
 }
 
 /**
+ * 递归校验值是否符合 JSON Schema 的 `type` / `required` / `additionalProperties:false`。
+ *
+ * 宿主对工具输出做的是严格校验：返回值里冒出一个 schema 没声明的键，**整个调用**
+ * 就被判 invalid output —— `search` 就曾在 schema 里漏声明 `score`，结果一条命中
+ * 都取不回来。所以这里校的是「字段有没有多出来」，而不是值对不对。
+ * 项目不装依赖，手写这三项检查足够守住那条失败路径。
+ *
+ * @param {unknown} value - 待校验的返回值。
+ * @param {object} schema - JSON Schema 节点。
+ * @param {string} [path] - 用于定位的字段路径。
+ * @returns {string[]} 违规说明，空数组代表通过。
+ */
+function schemaViolations(value, schema, path = '$') {
+  const found = []
+  const typeOf = (v) => (v === null ? 'null' : Array.isArray(v) ? 'array' : typeof v)
+
+  if (typeof schema !== 'object' || schema === null) return found
+
+  if (schema.type === 'object') {
+    if (typeOf(value) !== 'object') {
+      return [`${path}: 期望 object，实际 ${typeOf(value)}`]
+    }
+    const props = schema.properties ?? {}
+    for (const key of schema.required ?? []) {
+      if (!(key in value)) found.push(`${path}.${key}: required 字段缺失`)
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(value)) {
+        if (!(key in props)) found.push(`${path}.${key}: schema 未声明该字段`)
+      }
+    }
+    for (const key of Object.keys(value)) {
+      if (key in props) found.push(...schemaViolations(value[key], props[key], `${path}.${key}`))
+    }
+    return found
+  }
+
+  if (schema.type === 'array') {
+    if (typeOf(value) !== 'array') {
+      return [`${path}: 期望 array，实际 ${typeOf(value)}`]
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      found.push(...schemaViolations(value[index], schema.items ?? {}, `${path}[${index}]`))
+    }
+    return found
+  }
+
+  if (schema.type === 'string') return typeof value === 'string' ? found : [`${path}: 期望 string，实际 ${typeOf(value)}`]
+  if (schema.type === 'boolean') return typeof value === 'boolean' ? found : [`${path}: 期望 boolean，实际 ${typeOf(value)}`]
+  if (schema.type === 'integer') {
+    return Number.isInteger(value) ? found : [`${path}: 期望 integer，实际 ${typeOf(value)}`]
+  }
+  if (schema.type === 'number') {
+    // NaN / Infinity 不是合法 JSON number，宿主同样会判非法，这里一并拦住。
+    return typeof value === 'number' && Number.isFinite(value)
+      ? found
+      : [`${path}: 期望有限 number，实际 ${String(value)}`]
+  }
+  return found
+}
+
+/**
  * 建一套完整的 deps + ctx + session 测试夹具。
  * @param {object} [options]
  * @param {object} [options.config] - 覆盖的配置字段。
@@ -1215,4 +1277,49 @@ test('总开关关闭：/remember 与 /memory-digest 只回提示，不写库、
   assert.equal(ok.kind, 'success', '重新开启后命令应恢复')
   const after = await h.store.readDoc({ kind: 'global', presetId: 'default' })
   assert.ok(after.content.includes('喜欢深色主题'))
+})
+
+// ——————————————————————————————————————————————
+// §5.4 工具输出 schema 守护
+// ——————————————————————————————————————————————
+
+test('memory 工具：每个 action 的返回值都不得带 output.schema 未声明的字段', async (t) => {
+  // 宿主对工具输出做严格校验：多冒出一个没声明的键，**整个调用**被判 invalid
+  // output，一条结果都拿不回来——`search` 就曾在 schema 里漏声明 `score`，
+  // 结果检索全线不可用。这里逐个 action 拿真实返回值过一遍 schema，
+  // 覆盖成功、未命中、拒绝和失败四条路径，字段只多不少。
+  const h = await makeHarness()
+  t.after(h.cleanup)
+  const tool = takeMemoryTool(h)
+  const schema = tool.output.schema
+  const exec = { agent: h.agent, signal: { aborted: false } }
+
+  const violations = []
+  const run = async (label, args) => {
+    const result = await tool.execute(args, exec)
+    for (const item of schemaViolations(result, schema)) violations.push(`${label} → ${item}`)
+    return result
+  }
+
+  await run('append', { action: 'append', scope: 'global', content: '项目使用 pnpm。', reason: '守护用例' })
+  await run('read', { action: 'read', scope: 'global' })
+  const searched = await run('search', { action: 'search', query: 'pnpm' })
+  await run('search 未命中', { action: 'search', query: '绝对不存在的词' })
+  await run('list', { action: 'list' })
+  await run('replace', { action: 'replace', scope: 'user', content: '用户是后端工程师。' })
+  await run('digest 成功', { action: 'digest' })
+  h.setDigestReport({ at: new Date().toISOString(), ok: false, error: '模型不可用' })
+  await run('digest 失败', { action: 'digest' })
+  await run('未知 action', { action: 'nope' })
+  await run('search 缺 query', { action: 'search' })
+  await run('soul 缺 confirm', { action: 'replace', scope: 'soul', content: '新人格。' })
+
+  // 守护不能空跑：search 必须真有命中，否则 matches[].score 根本没进过校验。
+  assert.ok(searched.matches.length > 0, 'search 用例必须命中，否则这条守护测不到 matches 里的字段')
+  assert.ok(
+    searched.matches.every((hit) => Number.isFinite(hit.score)),
+    '每条命中都应带有限的相关性分数（NaN 同样会被宿主判非法）',
+  )
+
+  assert.deepEqual(violations, [])
 })
