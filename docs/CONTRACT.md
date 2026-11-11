@@ -2563,3 +2563,175 @@ core 该留哪几条、有几条被折进目录、各段多少字节，全都可
 以及编辑器下方的「字节数：{bytes}」（那是文件真实大小，属盘上事实）。
 
 **边界**：本次只动面板展示，`config` 里的预算字段与渲染层的裁剪逻辑一个字未改。
+
+## V9.0 会话级人设（主人裁决，2026-11-11）
+
+**产品决策（已确认，不再讨论）**：一个会话可单独指定人设；未指定则跟随全局 `currentPersona`。
+分支会话**不继承**（普通 fork 的 header 不写 `parentSession`，只打 `isSeeded: true`，无法可靠上溯，
+见 V9.1 第 4 条）。子智能体维持现状（`injectIntoSubagents: false` 本来就不注入）。
+
+### V9.1 数据模型
+
+文件：`<dshHome>/supermemory/session-personas.json`
+
+```json
+{ "version": 1, "sessions": { "session-0192...": "灰灰" } }
+```
+
+- **只记录被单独指定过的会话**。键缺席 = 跟随全局，绝不写「= 全局当前值」这类固化条目。
+- 值是人设 slug（经 `personaSlug` 归一）。
+- `version` 固定 `1`；非法/缺失一律按空表读取，**不猜、不迁移、不抛错**。
+- 该文件不参与 `personas.json` 的迁移流程，两者彼此独立。
+
+### V9.2 新模块 `lib/core/session-personas.js`（A 负责）
+
+纯函数与一个轻量存储实例。**不 import 任何宿主包**，只依赖 `node:fs/promises`、`node:path`。
+
+```js
+export const SESSION_PERSONAS_VERSION = 1
+export const SESSION_MAP_FILE = 'session-personas.json'
+export const SESSION_ID_MAX = 200
+
+/** 校验 sessionId：非空、≤200、白名单 [A-Za-z0-9._:-]、不含 NUL。 */
+export function checkSessionId(value) -> { ok:true, value } | { ok:false, error }
+
+/** 把任意读到的 JSON 收敛成 { version:1, sessions:{} }。非对象/sessions 非对象 → 空表。 */
+export function normalizeSessionMap(value) -> { version:1, sessions:Record<string,string> }
+
+/** 纯函数：返回新 map，不改入参。slug 经 personaSlug 归一。 */
+export function setPersonaInMap(map, sessionId, slug) -> map
+
+/** 纯函数：返回新 map，删掉 sessions[sessionId]。 */
+export function clearPersonaInMap(map, sessionId) -> map
+
+/** 纯函数：清掉所有值等于 slug 的条目。返回 { map, cleared }。 */
+export function removePersonaFromMap(map, slug) -> { map, cleared:number }
+
+/** 纯函数：解析某会话生效的人设。未绑定返回 fallback。 */
+export function resolvePersonaForSession(map, sessionId, fallback) -> { slug:string, source:'session'|'global' }
+
+/**
+ * 建实例。filePath 是该 json 的绝对路径。
+ * @returns {{
+ *   ready: Promise<void>,
+ *   get(sessionId) -> string|undefined,          // 同步读内存态；ready 未完成时返回 undefined
+ *   getWithSource(sessionId) -> {slug,source}|undefined, // 同步，source 恒为 'session'
+ *   snapshot() -> {version,sessions},            // 深拷贝，调用方改不到内存态
+ *   set(sessionId, slug) -> Promise<{ok:true,sessions:object}|{ok:false,code,message}>,
+ *   clear(sessionId) -> Promise<{ok:true,removed:boolean}|{ok:false,code,message}>,
+ *   removePersona(slug) -> Promise<{ok:true,cleared:number}|{ok:false,code,message}>,
+ *   dispose() -> Promise<void>,
+ * }}
+ */
+export function createSessionPersonas({ filePath, logger, now }) -> instance
+```
+
+**铁律**：
+
+1. `get` 必须**同步**——`systemPrompt.section` 的 `text` 回调同步执行，不能 await。
+2. 任何 IO 异常一律转成返回值里的 `code`（`UNWRITABLE` / `BAD_INPUT`），**绝不抛**。
+3. 写盘走「同目录临时文件 + rename」，并串行化同路径写（照 `store.js` 的 `enqueue` / `writeJsonAtomic` 写法）。
+4. `set` / `clear` / `removePersona` 成功后立刻更新内存态；失败**不改**内存态。
+5. 构造时异步加载一次，`ready` 完成前 `get` 返回 `undefined`（等价于跟随全局，安全降级）。
+
+### V9.3 装配层接入 `lib/index.js`（Lead 负责）
+
+`resolveScope(agent)` 取值顺序：
+
+1. `agent.session.id` 有绑定 → 用它，`personaSource = 'session'`
+2. 绑定的人设已不在 `store.listPersonas()` 里（已删）→ 回退全局，并 fire-and-forget 调
+   `sessionPersonas.removePersona(slug)` 清僵尸
+3. 否则 → 全局 `currentPersona()`，`personaSource = 'global'`
+
+`resolveScope` 返回值新增 `personaSource` 字段（`'session'|'global'`），并透传到 `activeContext`，
+供 bootstrap 展示。
+
+`deps.personas.remove` 包装层在人设删除成功后调用 `sessionPersonas.removePersona(slug)`，
+**不改 `lib/core/store.js`**。
+
+### V9.4 路由 `lib/host/routes-session-persona.js`（B 负责）
+
+新文件，导出 `createSessionPersonaHandlers({ deps, access }) -> { handleSessionPersona }`。
+`ROUTES.sessionPersona` = `api/dsh-supermemory/session-persona`，由 Lead 在 `routes.js` 注册。
+
+**GET** `?sessionId=<id>`
+
+```json
+{ "ok": true, "data": {
+  "sessionId": "session-...",
+  "persona": { "slug": "灰灰", "name": "灰灰" },
+  "source": "session",
+  "globalPersona": { "slug": "default", "name": "Default" },
+  "personas": [ { "slug": "...", "name": "..." } ]
+} }
+```
+
+- `persona` 是**本会话实际生效**的人设；`source` 说明它从哪来。
+- 人设列表缺失时 `personas` 返回 `[]`，`persona` 仍要给出（按 slug 兜底 name）。
+- `sessionId` 非法 → 400 `BAD_INPUT`。
+
+**PUT** body `{ sessionId, slug }`
+
+- `slug` 非空 → 绑定。人设不存在 → 404 `PERSONA_NOT_FOUND`。
+- `slug` 为空串 → 清除绑定，恢复跟随全局（幂等，未绑定时也返回 ok）。
+- 成功回带与 GET 相同的 `data` 结构，前端可直接替换本地态。
+- `sessionId` 非法 → 400 `BAD_INPUT`；body 不是对象 → 400（交给 `readJsonBody`）。
+
+**总开关**：与 `personas` 系列同口径——**不做 `pluginEnabled()` 拦截**（关闭插件后仍可改绑，
+与「人设三件套不被软开关锁死」保持一致）。
+
+### V9.5 客户端 `lib/client.js` + `locale/*.json`（C 负责）
+
+槽位：`conversation.input.right`（输入框右侧、模型选择器左边），`inject: (sessionId) => ({...})`。
+
+```js
+ctx.slots.inject('conversation.input.right', () => ctx.slots.register(
+  { name: 'conversation.input.right', id: 'supermemory-persona', order: 10, locale: NS },
+  wirePersonaPill,
+))
+```
+
+**重要**：`conversation.input.right` 只在 `sessionId !== undefined` 时渲染（宿主 `client.js` 的
+渲染条件），所以组件可以假定 `sessionId` 存在；但仍要防御性地判空并返回 `null`。
+
+组件行为：
+
+- 胶囊按钮显示当前生效人设名，前面带一个人设小图标；`aria-label` 给完整说明。
+- 点击展开下拉：第一项「跟随全局（{全局人设名}）」，其后是人设列表，当前项打勾。
+- 选中即 `PUT session-persona`，成功后用响应回带的数据刷新本地态；失败恢复原状并提示。
+- 本会话被单独指定时，胶囊加 `is-bound` 类（细描边），一眼区分于「跟随全局」。
+- 只读不写：不提供新建/重命名/删除人设的入口（那是面板的职责）。
+- 关闭点击外部 / Escape 收起；不用 `window.confirm`。
+- 样式只许用 §9 的 `--dsw-alias-*` token，类名 `sm-persona-pill*`。
+
+新增 locale 键（4 处逐键同步：内嵌 `en`/`zh` + `locale/en.json` + `locale/zh.json`）：
+
+| key | zh |
+|---|---|
+| `pill.label` | 会话人设 |
+| `pill.followGlobal` | 跟随全局（{name}） |
+| `pill.bound` | 本会话单独指定：{name} |
+| `pill.switched` | 已切换为「{name}」，下一轮发言生效。 |
+| `pill.switchFailed` | 切换人设失败：{error} |
+| `pill.loading` | 加载人设… |
+| `pill.close` | 收起 |
+
+**测试影响（必须同步，不许删断言）**：`test/client-toggle.test.js` 的
+`assert.deepEqual(client.injected, ['sidebar.panellist', 'main', 'settings.section'])`
+要改成包含新槽位的有序数组；`test/client-persona-crud.test.js` 若对 `slots` 数量有断言，同样同步。
+这是**契约要求的同步修改**，不是删断言。
+
+### V9.6 文件归属（v9，仅列新增/变更）
+
+| 成员 | 独占写作用域 |
+|---|---|
+| Lead | `docs/CONTRACT.md`、`lib/index.js`、`lib/host/routes.js`（`ROUTES` 与 `registrations` 两处） |
+| A core-session | `lib/core/session-personas.js`、`test/session-personas.test.js` |
+| B host-routes | `lib/host/routes-session-persona.js`、`test/routes-session-persona.test.js` |
+| C client | `lib/client.js`、`locale/en.json`、`locale/zh.json`、`test/client-persona-pill.test.js`，以及 §V9.5 列明的既有客户端测试同步 |
+
+### V9.7 验收
+
+- 全量 `node --test --test-concurrency=1` **0 fail**（基线 816 例只增不减）。
+- 每条新增模块都要有自己的测试文件，覆盖：正常路径、非法输入、IO 失败降级、僵尸清理。
+- 客户端用例必须能证明：未绑定时显示全局人设名、绑定时加 `is-bound`、切「跟随全局」会发空 slug。
