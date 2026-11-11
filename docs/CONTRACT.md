@@ -2105,10 +2105,13 @@ core 段该收缩的时机是「总量逼近 `injectMaxBytes`」，不是「超�
 ## V8.11 可观测（`lib/host/routes.js` 归 C，`lib/client.js` / `locale/*.json` 归 D）
 
 `memory` 的 `list`、`GET /doc`、整理报告 `runs.jsonl` 各补：core / cold 条数、主题数、
-三段各自字节、预取命中数、被临时折进目录的条目数。面板加一节分层概览，只用 `--dsw-alias-*`
-token，无 JSX，`lib/client.js` 保持单文件。
+盘上字节。面板加一节分层概览，只用 `--dsw-alias-*` token，无 JSX，`lib/client.js` 保持单文件。
 
-**没有这一节，用户无法判断分层到底有没有用，也无法发现"目录涨太快"。** 不属于可裁剪范围。
+**没有这一节，用户无法一眼看出盘上有多少常驻、多少冷层、几个主题。** 不属于可裁剪范围。
+
+**只报盘上事实，不报注入侧估算**（见 V8.16 第 1 条）：`GET /doc` 的 `tiering` 只含
+`core` / `cold` / `topics` / `orphanTopics` / `docBytes`；`injectedCore` / `hiddenCold` /
+`overflowIds` / `coreBytes` / `indexBytes` / `totalBytes` 全部撤除，面板对应六格与两条预算条一并删除。
 
 ## V8.12 文件归属表（v8，覆盖 §1 的归属冲突）
 
@@ -2306,15 +2309,15 @@ v8.1.2 把降级形态从「全量索引」改成「core 正文 + 主题目录�
   不透出就再也还原不出「模型写错了什么」。
 - 主题名 / tier 判据一律复用 `entry-format.js`：批准，属单一来源纪律。
 - `summary: 42` → `''`、`aliases: "a, b"` → `['a','b']`：批准。
-- **`GET /doc` 的注入口径拿不到就省略字段，不许报 0**——0 会被面板读成「一个字节都没注入」。
+- ~~**`GET /doc` 的注入口径拿不到就省略字段，不许报 0**~~：该组字段已按 V8.16 第 1 条整体撤除，
+  这一条随之作废。「拿不到就省略、绝不用 0 顶替」仍是 `tiering` 全体字段的纪律。
 
 ### 15. 面板降级约定（D 必读）
 
 - runs.jsonl 的 `consolidation`（含 `tiers` / `topics` / `orphanTopics` / `invalidTiers`）
   **只在 consolidate 轮存在**；追加模式的 run 没有分层统计，不许假设每条 run 都有。
 - `tiering` 里盘上事实（`core` / `cold` / `topics` / `docBytes`）恒给；
-  注入口径（`injectedCore` / `hiddenCold` / `overflowIds` / `totalBytes` / `coreBytes` /
-  `indexBytes`）可能整个缺席，必须缺字段降级。
+  注入口径已按 V8.16 第 1 条整体撤除，**不存在「可能缺席」这一档了**——不要再往回接。
 
 ### 16. `recall` 的实际形状是**条目数组**，V8.15 第 1 条作废
 
@@ -2505,3 +2508,58 @@ range 覆盖到、但不在 `seqs` 里的事件**必须保留**。
 
 整编输入里那一节的小标题措辞**必须说「没有数字表示这一轮没拿到它的命中数，不等于零命中」**，
 不许简化回「没有数字表示还没有统计」（在前 10 截断下那句不成立，即便本条已修也留着当防线）。
+
+## V8.16 撤除注入口径估算值（主人裁决，2026-11-11）
+
+### 1. `GET /doc` 的 `tiering` 只报盘上事实
+
+**背景**：v8.11 曾要求 `tiering` 同时给出注入口径（`injectedCore` / `hiddenCold` /
+`overflowIds` / `coreBytes` / `indexBytes` / `totalBytes`）。那组值由 `tierOverview()` 现场
+调一次 `buildProjectSection` 重算得到，而重算**没传 `usage`**（排序退化成纯时间倒序）、
+**没传 `injectMaxBytes`**（缺总预算的第 2~5 级降级），所以它和那一轮真实注入可能对不上：
+core 该留哪几条、有几条被折进目录、各段多少字节，全都可能不同。
+
+**裁决**：估算不准就干脆不要。面板上对不上的数字比没有数字更糟——用户会拿它做决定。
+
+- `tiering` 只保留 `core` / `cold` / `topics` / `orphanTopics` / `docBytes`，全部从磁盘现算；
+- `tierOverview()` 里那段 `buildProjectSection` 重算整段删除，`projectName` 参数一并去掉；
+- `lib/client.js` 的分层概览删掉「注入 core / 未注入冷层 / 折进目录 / core 段 / 目录段 /
+  注入合计」六格与两条 core·目录预算条，只留盘上事实那一行；
+- 对应九个词典键（`panel.tier.injectedCore` / `hiddenCold` / `overflow` / `coreBytes` /
+  `indexBytes` / `totalBytes` / `budget.core` / `budget.index` / `injectUnknown`）四处全删。
+
+**要观测真实注入了多少，唯一可信的途径是看那一轮的注入文本本身**（快照的
+`byteSections.global` / `byteSections.project` 是落盘那一刻的真值，但它只有两段总计）。
+不要再把「盘上文件多大」当成「上下文吃多少」——分层之后两者本来就不等。
+
+### 2. 仍然保留的（同一裁决，明确不删）
+
+- `tiering` 的盘上事实五项；
+- `memory` 工具 `list` 的 `coreBytes` / `indexBytes`。
+
+最后这条与本次撤除的东西**性质相同，都是重算值**，是否一并撤除尚未裁决；
+在那之前保持现状，不许顺手改动。
+
+（面板顶部两条预算条原本列在这里，已按下面第 3 条一并撤除。）
+
+### 3. 面板顶部两条预算占用条一并撤除（同一裁决的延伸）
+
+删掉的两条：
+
+- **「注入」条**：`used = soul + user + global + project 四个文件字节之和`，`total = injectMaxBytes`。
+  口径错误是结构性的——`soul`/`user` 走 systemPrompt 的 section、吃 `systemPromptMaxBytes`；
+  `global`/`project` 走记忆快照、吃 `injectMaxBytes`。**两个预算下的内容不能相加再除以其中一个**。
+  它同时也是「盘上文件大小」，而分层之后盘上大小 ≠ 注入量（冷层条目只进目录）。
+- **「人格」条**：`used = soul.md 的文件字节`，`total = systemPromptMaxBytes`。真实的人格 section
+  是 `buildPersonaSection({ soul, user })` 的输出，**含整个用户画像段和两个段标题**；
+  只数 `soul.md` 会严重低估（实测 2018 vs 真实 5027 字节）。
+
+配套删除：`BudgetBar` 组件、`.sm-budget` / `.sm-budget-head` / `.sm-bar` / `.sm-bar-fill*` 六条
+样式、`panel.budget.inject` / `panel.budget.persona` 两个词典键、`injectBudget` / `personaBudget` /
+`totalBytes` / `personaBytes` 四个局部变量。
+
+**保留**：设置页的预算值本身（`injectMaxBytes` / `systemPromptMaxBytes` /
+`projectCoreMaxBytes` / `projectIndexMaxBytes` 是真实的配置项，改它们有意义，值本身不是估算），
+以及编辑器下方的「字节数：{bytes}」（那是文件真实大小，属盘上事实）。
+
+**边界**：本次只动面板展示，`config` 里的预算字段与渲染层的裁剪逻辑一个字未改。
