@@ -2735,3 +2735,91 @@ ctx.slots.inject('conversation.input.right', () => ctx.slots.register(
 - 全量 `node --test --test-concurrency=1` **0 fail**（基线 816 例只增不减）。
 - 每条新增模块都要有自己的测试文件，覆盖：正常路径、非法输入、IO 失败降级、僵尸清理。
 - 客户端用例必须能证明：未绑定时显示全局人设名、绑定时加 `is-bound`、切「跟随全局」会发空 slug。
+
+## V10.0 修复会话人设串台与冷启动人格丢失（主人裁决，2026-11-11）
+
+**背景**：v9 上线后，主人报告「新会话里选的人格不生效」。实测核对真实会话日志，
+问题比报告严重得多——**不是第一条不生效，而是整场对话用错人格**：
+
+| 会话 | 绑定人设 | 实际注入 |
+|---|---|---|
+| `session-5d88…` | 旺财 | 佩玲 |
+| `session-a3dd…` | 旺财 | 旺财 |
+| `session-271c…` | 来福 | 旺财 |
+
+### V10.1 根因一：人格 section 读了模块级缓存 `activeScope`
+
+`lib/host/inject.js` 的 `systemPrompt.section` 回调原先读 `activeScope`——一个由
+`agent/pre-step` 维护的模块级单变量。宿主 `dsh-agent-loop` 的顺序是：
+
+```
+preStep(): systemPrompt.assemble(...)   ← section 回调在这里执行（第 679 行）
+           dispatch.waterfall('agent/pre-step', ...)  ← adoptScope 在这里才更新（第 685 行）
+```
+
+两个致命后果：
+
+1. **慢一轮**：section 读到的永远是上一轮的值。新会话第一次发言时 `activeScope`
+   里是任意其它会话的残留，因此「第一次发言必错」。
+2. **跨会话串台**：单变量被所有会话共享，多会话交替时后处理的会话覆盖前一个。
+
+**修法**：section 回调改为**按传入的 `assembly.agent` 现场同步解析**，绝不读模块级状态。
+
+- `lib/index.js` 新增 `resolvePersonaSync(agent)`：同步、按 agent 现算，返回
+  `{ persona, personaSource }`。只调同步 API（`currentPersona` / `listPersonas` /
+  `sessionPersonas.get`），因此可在 section 回调里直接跑。
+- `lib/index.js` 的 `resolveScope` 改为复用 `resolvePersonaSync`（单一来源）。
+- `lib/host/inject.js` 新增 `resolvePersonaOf(agent)`：优先用 `deps.resolvePersonaSync`，
+  缺失时退回只认全局 current 的最小实现。
+- 快照侧同步清理：`composeSnapshot` 的 `projectName` 改为由调用方从本次 `scope` 传入，
+  pre-step 内的 `persona` / `projectRoot` 一律用局部 `scope`，不再读 `activeScope`。
+
+**保留**：`activeScope` 仍存在，但**只**服务快照侧的既有逻辑（`adoptScope` 的写入）
+与 bootstrap 展示，**不得**再作为人格来源。
+
+### V10.2 根因二：`readDocSync` 冷启动返回空模板
+
+`store.readDocSync` **只读进程内缓存、不读盘**（这是它的既有契约，见 store.js 注释）。
+进程刚启动时缓存为空，它返回空模板：
+
+```
+实测：首次同步读得到 57 字节的空模板（"# 人格 (soul)\n\n<!-- 由 … -->\n\n## 条目\n"），
+      真实内容要等异步 readDoc 之后才进缓存。
+```
+
+于是即使人设解析正确，冷启动第一次注入也可能是空人格。
+
+**修法**：`agent/created` 时按该 agent 实际生效的人设（会话绑定优先）异步预热
+soul / user 进缓存。
+
+**关键**：监听器必须 **`return` 那个 Promise**。`dsh-agent` 的 `announce()` 是
+`await ctx.serial(..., "agent/created", ...)`，宿主会等监听器的返回值。早先写成
+`Promise.resolve().then(...)` 且不 return，等于 fire-and-forget，宿主立刻往下走，
+第一次 assemble 仍可能在预热完成前执行——这是最后一道口子。
+
+### V10.3 测试（`test/session-persona-isolation.test.js`，8 例）
+
+守护点：
+
+1. 多会话交替（A→B→A→C→B→A）每次 section 都取到各自的人设，绝不串台；
+2. **没跑过 pre-step** 也能拿到正确人设（旧实现的致命点）；
+3. 切换绑定后下一次 section 立刻跟随；
+4. 绑定的人设被删 → 回退全局，不注入空人格；
+5. 全局 current 变更：未绑定会话跟随，已绑定会话不受影响；
+6. 调用日志证明是「按 agent 现算」（每次渲染触发一次现算）；
+7. pre-step 快照用本次 scope，不混入其它会话的记忆；
+8. 冷启动空缓存：`agent/created` 的预热必须在宿主 await 结束前完成。
+
+**夹具两条硬约定**（踩过）：
+
+- 必须复刻宿主的 `decision.messages` 提交动作，否则首次快照永远落不到日志；
+- session 桩必须预置 `system/message` 占 `events[0]`（受保护头部），否则注入整体让路。
+
+**已反向验证**：把 section 改回读模块级缓存后，8 例中 6 例转红；把 `agent/created`
+改回 fire-and-forget 后第 8 例转红。这两次反向验证证明了用例确实能抓住该缺陷。
+
+### V10.4 明确不做（主人裁决）
+
+- **空白会话 id 可能被 Host 更换**（`dsh-api-session-controller` 的
+  `if (!reusable) return this.createMinted(...)`）：本次不修，先观察修完 V10.1/V10.2
+  后的实际表现。若仍有「绑定丢失」，再单独处理。
