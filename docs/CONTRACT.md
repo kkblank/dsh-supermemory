@@ -1529,7 +1529,7 @@ deletePersona(slug)
 ```
 idle   : 人设 [下拉 ▾] [✎] [🗑]  [+ 添加人设]
 rename : 人设 [下拉 ▾] [输入框(预填当前显示名)] [保存] [取消]
-delete : 人设 [下拉 ▾] 确定删除「灰灰」及其人格、画像与全局记忆？此操作不可撤销。 [删除] [取消]
+delete : 人设 [下拉 ▾] 确定删除「{当前人设名}」及其人格、画像与全局记忆？此操作不可撤销。 [删除] [取消]
 ```
 
 - 状态两位：`personaAction: 'idle'|'rename'|'delete'`、`renameValue: string`。
@@ -2575,7 +2575,7 @@ core 该留哪几条、有几条被折进目录、各段多少字节，全都可
 文件：`<dshHome>/supermemory/session-personas.json`
 
 ```json
-{ "version": 1, "sessions": { "session-0192...": "灰灰" } }
+{ "version": 1, "sessions": { "session-0192...": "人设A" } }
 ```
 
 - **只记录被单独指定过的会话**。键缺席 = 跟随全局，绝不写「= 全局当前值」这类固化条目。
@@ -2659,7 +2659,7 @@ export function createSessionPersonas({ filePath, logger, now }) -> instance
 ```json
 { "ok": true, "data": {
   "sessionId": "session-...",
-  "persona": { "slug": "灰灰", "name": "灰灰" },
+  "persona": { "slug": "人设A", "name": "人设A" },
   "source": "session",
   "globalPersona": { "slug": "default", "name": "Default" },
   "personas": [ { "slug": "...", "name": "..." } ]
@@ -2743,9 +2743,9 @@ ctx.slots.inject('conversation.input.right', () => ctx.slots.register(
 
 | 会话 | 绑定人设 | 实际注入 |
 |---|---|---|
-| `session-5d88…` | 旺财 | 佩玲 |
-| `session-a3dd…` | 旺财 | 旺财 |
-| `session-271c…` | 来福 | 旺财 |
+| 会话甲 | 人设A | 人设B（错） |
+| 会话乙 | 人设A | 人设A（对） |
+| 会话丙 | 人设C | 人设A（错） |
 
 ### V10.1 根因一：人格 section 读了模块级缓存 `activeScope`
 
