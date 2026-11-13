@@ -38,6 +38,15 @@
         # 记忆长到 32 条 / 12KB 后需重述全部条目，思考量按同比例约 49k tokens，16000 被吃穿、
         # 正文一个字没产出，报错表现为「输出被 maxTokens 截断」。
         # 本值是显式配置，会压住 config.js 的 zod default（改默认值对本机无效，只影响新用户）。
-        # 记忆再长大若再次报截断，继续上调本值；256K 窗口下 60k 输出仍远未触及输入上限。
+        # v11（契约 §V11.0.3）：记忆再长**优先靠分批降精压单轮规模**，而不是继续上调本值——
+        # 规模线性增长时，调大预算只是把悬崖往后推。下面 5 项就是那个机制。
         digestConsolidateMaxOutputTokens: 60000
         digestSnapshotKeep: 3
+        # 整编分批降精（契约 §V11.0.3）：条目数超 30 后，一轮只整理一批主题（每批最多 5 个），
+        # 超 60 条改用更大的批（每批最多 8 个）。未达 30 条时行为与旧版逐字节相同。
+        # 批次优先挑「又大又冷」的主题：降精收益最高、风险最低。
+        digestTieredConsolidate: true
+        digestTier2MinEntries: 30
+        digestTier3MinEntries: 60
+        digestTier2BatchTopics: 5
+        digestTier3BatchTopics: 8

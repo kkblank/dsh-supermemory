@@ -2823,3 +2823,104 @@ soul / user 进缓存。
 - **空白会话 id 可能被 Host 更换**（`dsh-api-session-controller` 的
   `if (!reusable) return this.createMinted(...)`）：本次不修，先观察修完 V10.1/V10.2
   后的实际表现。若仍有「绑定丢失」，再单独处理。
+
+## V11.0 压缩补偿判据收紧与整编分批降精（主人裁决，2026-11-14）
+
+本节两项改动均经主人批准，来源是一次对外部压缩器（billion-context）的代码审查：
+**只吸收其机制里真正适用于我们的部分，不为其做任何对外妥协。**
+
+### V11.0.1 明确不做的三件事（已技术核实，勿再提议）
+
+1. **不采用宿主 `registerMessageProjection` 改写快照。** 核实结论：`plugin:` 记录强制
+   `ignorable: true`（`dsh-session/lib/index.js:1566`），未知 ignorable 事件不参与 surface
+   （同文件 `:301`）；投影类型白名单仅 `image/offload`（`:144`）；**最致命的是投影被移除后
+   会话拒绝派生**（`:584`，`restore the session with its owning plugin`）——那会让「临时
+   禁用插件」变成「废掉会话历史」。本项目永不采用。
+2. **不复用消息 id。** 外部压缩器对重复 id 整批弃用；复用比换新更糟。保持每次新 UUID。
+3. **不为兼容外部压缩器加任何标记行/一次性语义/`section` 注入模式。** 主人裁决：只考虑
+   自身好实现、设计无硬伤、不破坏对话。对外信号一概不做。
+
+### V11.0.2 压缩补偿判据收紧（`lib/host/inject.js`）
+
+**变更**：`needsResync` 由
+
+```js
+recallEnabled && (old === undefined ? compaction.seq >= 0 : compaction.seq > old.seq)
+```
+
+改为
+
+```js
+recallEnabled && old === undefined && compaction.seq >= 0
+```
+
+**理由**：旧判据的后半段「最近一次压缩晚于快照」会把「压缩压的是别处、快照好好留在
+surface 上」也判成需要补偿，于是白写一条 `replace` 事件——纯粹的历史抖动，且把一次可避免
+的历史改写让给了外部观察者。
+
+`lastSnapshotEvent` 已按 `session.surface.nodes`（退路是 `shadowed` 遮蔽集）过滤，
+返回 `undefined` 就等价于「快照确实不在 surface 上了」，这一条判据既充分又必要。
+
+**边界（必须保持）**：
+- 快照被压缩吞掉（`old === undefined` 且有压缩）→ **仍然重写**，否则模型永久失忆；
+- 开关 `compactionRecall=false` 关掉的只是「补偿重写」，**不影响**快照丢失后的基本自愈
+  （那条路径走的是首次注入通道，与开关无关）；
+- `surface` 读不到时走遮蔽集退路，不得因为读不到就反复重写。
+
+**测试**：`test/compaction-resync.test.js`（5 例）。同时把 `test/compaction-recall.test.js`
+里那条断言旧行为（「digest 未变也重写」）的用例改为断言新语义。
+
+### V11.0.3 整编分批降精（`lib/core/consolidate.js` 等）
+
+**问题**：整编是「重写整份 project 记忆」，思考量与**待重述规模成正比**。实测 32 条 / 12KB
+时 reasoning 已吃掉约 49k tokens、把 16000 的输出预算吃穿、正文零产出；靠调大输出预算
+只是把悬崖往后推。
+
+**配置**（`lib/host/config.js`，全部 `.volatile()`，只从 `cordis.patch.yml` 读，不进面板）：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `digestTieredConsolidate` | `true` | 分批总开关（回滚通道） |
+| `digestTier2MinEntries` | `30` | 进入分批的条目数阈值 |
+| `digestTier3MinEntries` | `60` | 提高到大批的条目数阈值（必须 > T2） |
+| `digestTier2BatchTopics` | `5` | T2 每批最多主题数 |
+| `digestTier3BatchTopics` | `8` | T3 每批最多主题数 |
+
+阈值 30 的依据：整编触发阈值是 20 条，实测踩坑起点是 32 条——20~29 条整份重写仍安全。
+
+**判定**：新增 `decideConsolidateScope()`，与 `shouldConsolidate()` **正交**——前者只决定
+范围，后者仍决定时机。三档：
+- 条目数 `< T2` → `batch=false`，**调用方走原有全量路径，行为逐字节不变**；
+- `T2 <= 条目数 < T3` → 分批，每批最多 5 主题；
+- `条目数 >= T3` → 分批，每批最多 8 主题。
+
+**批次选择**：条目数降序、热度升序（**又大又冷**优先）。降精收益与可压缩字节成正比，
+冷主题没人检索、压掉风险最低。名字兜底定序保证可复现。
+
+**防硬伤的四条**：
+
+1. **范围外条目原样保留**——输入里显式声明「范围之外还有 N 条，本轮不列出也不要提及，
+   系统会原样保留」，并用提示词把「绝不要输出精简版全量清单」说死。这是分批最危险的
+   失效模式（模型误以为整份记忆只有眼前几条）。
+2. **规则 5「没写不等于删除」在分批下继续成立**：`from`/`drop` 只能引用本批列出的 id，
+   跨批引用归入现有 `ghosts` 机制，该批不写盘。
+3. **三道栅栏完整保留**（`EMPTY` / `minKeepRatio` / `maxDropRatio`），只是作用域降为单批。
+4. **任何异常或非法配置退回全量**（保守侧），`scopeTopics` 为空数组表示「无范围限制」，
+   绝不当成「处理全部」。
+
+**未分类条目**归入 `UNTOPICIZED`（`lib/core/tier-index.js` 的既有常量，与主题目录同一套
+命名），不会被分批漏掉。
+
+**提示词**：分批时追加 `CONSOLIDATE_BATCH_NOTE`（`lib/host/digest-prompt.js`）；**全量时
+一字不加**，`CONSOLIDATE_SYSTEM_PROMPT` 逐字节不变——两条路径互不污染。
+
+**运行报告**：`RunRecord` 新增 `batchTier`（`0`=全量 / `2` / `3`）与 `batchTopics`（本批主题）。
+
+**测试**：`test/consolidate-batch.test.js`（14 例）。
+
+### V11.0.4 测试与验收
+
+- 全量基线由 **886** 升至 **905** 例（新增 19 例），`node --test --test-concurrency=1` 全绿。
+- 新增配置键后**必须同步三处**：`config.js` 的 zod `.default()` 与 `DEFAULTS`（两处一致）、
+  `test/paths-document.test.js` 的全默认断言、`test/config-consolidate.test.js` 的
+  `BATCH_DEFAULTS` / 键集合 / 键总数（**34**）。
