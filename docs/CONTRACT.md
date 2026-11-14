@@ -2924,3 +2924,218 @@ surface 上」也判成需要补偿，于是白写一条 `replace` 事件——�
 - 新增配置键后**必须同步三处**：`config.js` 的 zod `.default()` 与 `DEFAULTS`（两处一致）、
   `test/paths-document.test.js` 的全默认断言、`test/config-consolidate.test.js` 的
   `BATCH_DEFAULTS` / 键集合 / 键总数（**34**）。
+
+---
+
+## V12 热度衰减与快照重写治理（v12）
+
+本轮起因：对照 `dsh-memory-tiers` 的能力后，补两件事——**分层要有客观的时效依据**，
+以及**快照重写要能归因、能少写**。核心原则：**热度只提供参考信号，绝不改 `tier`。**
+
+### V12.1 热度衰减（`lib/core/usage.js`）
+
+| 项 | 契约 |
+|---|---|
+| 公式 | `score = log(1 + hits) × 0.5 ^ (ageDays / halfLifeDays)` |
+| 半衰期 | `DEFAULT_HALF_LIFE_DAYS = 30`（导出常量）；可传参覆盖，非正数退回默认 |
+| 落盘 | **衰减分不落盘**。`usage.json` 仍只存 `{ hits, last }`，`score` / `ageDays` 都是派生值 |
+| 新增导出 | `decayScore(stat, now, halfLifeDays)`、`ageDays(stat, now)`、`entryRows(usage, opts)` |
+| `ageDays` 实现约束 | **不得借道 `readStat`**：后者把 `hits` 当必填，只有 `last` 的项会被整项判废，导致「3 天前用过」被误报成 `Infinity` |
+| 缺 `last` 时 | `decayScore` 退回 `log(1+hits)`（按「刚刚用过」），不按「远古」判冷 |
+| 时钟回拨 | `last` 在未来按 0 天算，系数不超过 1 |
+| `usageSummary(usage, opts)` | 不传 `opts` 时**行为与升级前逐字节一致**（`score = log(1+hits)`、`ageDays = null`）；传了才按衰减排序 |
+| 排序方向 | 有 `opts`：按 `score` 降序；无 `opts`：按 `hits` 降序（旧行为） |
+
+**为什么必须衰减**：`hits` 是只增不减的累加值，「三年前被搜过 20 次」和「昨天被搜过 20 次」
+在它眼里完全一样；冷热分层的意义全在时效，而时效只在 `last` 里。
+
+**为什么取对数**：命中长尾极重，线性会让头名永远霸榜；取对数后「20 次 vs 200 次」只差约
+1.9 倍，排序仍由时效主导。
+
+### V12.2 快照重写归因（`lib/core/snapshot-tiered.js` + `lib/host/inject.js`）
+
+`buildTieredSnapshot` 额外返回 `parts`：五维短指纹
+`{ global, project, projectName, truncated, recall }`（各 8 位 sha1；`truncated` 为可读的
+`'true'/'false'`）。**`parts` 不参与 `digest` 计算**，只供归因比对。
+
+`attributeRewrite(prevSource, nextSnapshot, needsResync)` 返回 `{ reason, changed }`：
+
+| `reason` | 含义 |
+|---|---|
+| `first` | 首次写入 |
+| `resync` | 压缩吞掉快照后的强制重同步（**优先于内容维度判断**） |
+| `content` | 五维中至少一维变化，`changed` 列出具体维度 |
+| `unknown` | 无 `parts` 可比（升级前的旧快照），不猜 |
+
+快照 `source` 新增两个键：`parts`（五维指纹）与 `rewrite`（本次归因）。
+两者**缺省时不落键**，保持旧调用方逐字节不变。
+
+### V12.3 预取空结果可观测（`lib/host/inject.js`）
+
+`snapshot.stats.recallSkipReason` 取值：
+
+| 值 | 含义 |
+|---|---|
+| `no-query` | 本轮拿不到用户输入 |
+| `no-entries` | 项目记忆里没有条目 |
+| `no-match` | 检索零命中 |
+| `no-candidates` | 有命中但都不是冷层、也没被预算挤出 |
+| `empty` | 候选有 id 但回填不出正文 |
+| `cooling` | 冷却期内沿用上轮（有内容但未换血） |
+
+有预取内容时该键缺席。**只加一个键，不改 `stats` 既有形状。**
+
+### V12.4 重写抑制与预取稳定（`lib/host/inject.js` + `lib/host/inject-recall.js`）
+
+**a) 预取不许因「本轮无候选」而清空**
+
+`decideRecallSwap` 新增：`current.length === 0 && prevIds.length > 0` → 沿用上轮，
+返回 `held: true`。实测 6 个真实会话 18 次 replace 里 5 次是这类翻转，表现为「本轮相关
+记忆」整段有→无→有，对模型的伤害比缓存更重：**同一批记忆时有时无，模型无法判断该不该依赖**。
+
+**b) 仅 recall 变时延后整块重写**
+
+`shouldDeferRewrite(rewrite, prevSource)`：当且仅当 `reason === 'content'`、
+`changed` 恰为 `['recall']`、且**旧快照已有 `recall`** 时返回 `true`，跳过本轮重写。
+正文不变时不为换 2 KB 预取小节重写整块，避免快照之后约一半上下文的缓存失效。
+
+旧快照**没有**预取时必须写，否则预取永远出不来；`resync` / `first` / `unknown` 一律不延后。
+
+### V12.5 分层判定护栏（`lib/host/digest-prompt.js`）
+
+整编提示词新增硬规矩：下列条目**一律不许写成 `cold`**，即使热度为 0、即使很久没被命中——
+
+1. `source` 为 `user-request` / `lead-summary` 的条目；
+2. 正文含明确硬约束的条目（「不得 / 不许 / 禁止 / 必须 / 一定要 / 永远不要」等）；
+3. 技术栈、环境约定、测试基线、协作流程类条目。
+
+**这是提示词层护栏，不是代码拦截**——代码硬拦会让整编直接报错，代价比多留几条 core 大得多。
+守护：`test/digest-prompt.test.js`。
+
+### V12.6 热度喂给整理器（`lib/host/digest-input.js` + `lib/index.js`）
+
+- 主题表每行追加「距今 D 天」（`formatAgeDays`：`1 天内` / `N 天` / `约 N 个月` / `约 N 年`）。
+- **没有 `ageDays` 时整段退回旧格式**，升级前后逐字节一致。
+- 同一主题多次给数时取**最近**的一次（问题问的是「最近还用过吗」）。
+- 装配层 `topicUsage` 传 `now: Date.now()`，使 `topicRows` 带衰减分。
+
+### V12.7 面板（`lib/client.js` + `locale/*.json`）
+
+`GET doc`（scope=project）的 `tiering` 新增 `heat`。**两级数据源合并**：
+
+| 来源 | 装配入口 | 行形状 |
+|---|---|---|
+| 主题级（先） | `deps.topicUsage` | `{ name, hits, last, score, ageDays }` |
+| 条目级（后） | `deps.entryUsage` | `{ id, hits, last, score, ageDays, preview, full, topic? }` |
+
+**必须两级都取**：`usage.json` 的 `topics` 分区只有在整理器建过主题表之后才有内容，
+而 `entries` 分区从第一次检索命中就在记。只读主题级会让面板在「项目还没建主题表」时永远
+空白——本项目实测就是 18 条条目热度、0 个主题，表格一直不出现。
+
+**两级都拿不到时省略该键**，不报空数组（空数组会被读成「确实没有热度」）。
+任一级的 `deps` 缺失时该级按空处理，不影响另一级，也不影响 doc 本身读取成功。
+
+面板分层概览新增 `HeatTable`：主题 / 命中 / 最近使用 / 衰减分。
+词典四处（client 内嵌 en、client 内嵌 zh、locale/en.json、locale/zh.json）必须逐键同步。
+
+### V12.8 硬约束（回归测试钉死）
+
+- **热度永不改 `tier`**：`test/heat-decay.test.js` 断言「无论热度怎么变，core/cold 条数恒定」。
+- **渲染期挤出 ≠ 降级**：预算紧张时被挤出正文的条目仍是 core，盘上原文一字不动。
+- 本次**不引入任何遗忘/删除功能**，也不新增后台定时器重算分层。
+
+### V12.9 测试与验收
+
+- 全量基线由 **886** 升至 **946** 例，`node --test --test-concurrency=1` 全绿。
+- 新增测试文件：`test/rewrite-attribution.test.js`（12 例）、`test/heat-decay.test.js`（11 例）、
+  `test/routes-doc-tiering.test.js` 内新增两级热度合并 4 例。
+
+### V12.13 主题围栏行不进检索结果（v12.3）
+
+**问题**：主题表围栏里那几行（`- 主题名 · 摘要 · aliases: …`）躺在 `## 条目` 之后、
+第一条记忆之前，**物理上就在被检索的正文里**，于是 `scoredLines` 把它们当普通行打分。
+命中后果是一行 `id` 为空的垃圾结果：下游读不了原文、算不了热度、渲染不出内容。
+
+**孤儿主题时最恶劣**：表里有名字、没有任何条目在用，但它的 `aliases` 仍在参与匹配，
+于是「搜一个词 → 只拿到一条根本不存在的记忆」。实测 20 个孤儿主题能让 `limit=5` 的
+返回里塞进 3 行这种垃圾。
+
+**解法**：`core/topics.js` 新增导出 `topicFenceLines(text)` → `Set<number>`（1-based 行号），
+`searchProjectDocs` 在返回前剔除落在围栏内的行。
+
+**判据必须精确到「围栏之内」，不能放宽成「不属于任何条目」**：`pitfalls.md` 这类手写文件的
+目录表格与前言说明同样不属于任何条目，但它们是用户要搜的正常正文。实测过滤前搜「宿主依赖」
+能命中 pitfalls.md 的目录行，这个能力不能丢。
+
+**半截围栏不触发过滤**：只有 `start` 没有 `end` 时 `topicFenceLines` 返回空集——
+宁可不过滤，也不猜结尾在哪（与 `locateFence` 的既有纪律一致）。
+
+**预取不受影响**：`searchProjectEntries` 只遍历条目，主题表只贡献别名、不产出独立结果，
+所以孤儿主题召回到的别名只影响打分，不会变成一条空记忆。
+
+守护：`test/search-extended.test.js` 新增 3 例（孤儿过滤 / 前言区仍可检索 / 半截围栏不过滤）。
+
+### V12.12 主题体系冷启动引导（v12.2）
+
+**问题**：整编跑成功（`ok:true, mode:consolidate`）却 `added:0 merged:0`、整编前后逐字节相同、
+`topics:0`。实测本项目 19 条条目**一个 `topic` 都没有**。
+
+**根因是死锁**：主题表由条目的 `topic` 汇总而来，而提示词又要求「`topic` 优先复用主题表里已有
+的名字」+「不写就是维持现状」。盘上一片空白时，两条规则互相等待，模型于是什么都不写。
+连续两轮整编空转都是这个原因。
+
+**解法**：`CONSOLIDATE_BOOTSTRAP_NOTE` —— **只在冷启动时**追加的一段引导，要求模型一次性
+建起主题体系。判定抽成纯函数 `selectConsolidateSystemPrompt({ topics, hasAnyTopic, batch })`。
+
+| 条件 | 是否追加冷启动引导 |
+|---|---|
+| 主题表空 且 条目无任何 `topic` | ✅ 追加 |
+| 主题表非空 | ❌ |
+| 主题表空但条目已有 `topic` | ❌（主题表被手删的情形，不能逼模型重新分类） |
+| `topics` 缺失/非数组 | 按空表处理，与「确实没有主题」同路 |
+
+**叠加顺序固定**：主提示 → 冷启动 → 分批说明。分批放最后，因为它那句「你只看到一部分」
+必须紧贴输出指令。
+
+**引导里必须讲清的两件事**（否则模型会输出空 `entries` 而以为完成了）：
+1. `topic` **只能挂在 `entries` 项上**，没有别的通道；`entries` 为空 = 一个 topic 都没写；
+2. 每条要输出的条目 `text` **逐字照抄原文**，`from` 填它自己的 id —— 这一步是补分类，
+   不是重写记忆，正文改一个字都算跑偏。
+
+**为什么不能写进主提示词**：主提示词每轮整编都读。把「给每个条目补 topic」写成无条件要求，
+模型每轮都会重新分类全部条目，主题名来回改，检索热度的锚点跟着断链。冷启动只发生一次。
+
+守护：`test/digest-prompt.test.js` 新增 5 例（含「主题表空但有条目 topic 时不触发」这条反向用例）；
+`test/injection-trigger.test.js` 的整编用例断言从「全等」改为「主提示在开头 + 冷启动段存在」。
+
+### V12.11 热度表的三处可用性修复（v12.1）
+
+**a) 孤儿过滤**：`entryRows(usage, { lookup })` 传了 `lookup` 时，`lookup(id)` 返回
+`null`/`undefined` 的行**不返回**。条目 id 由 `sha1(time + body)` 派生，整编改写正文就换代，
+旧 id 的热度永远留在 `usage.json` 里——本项目实测 18 条里 14 条是孤儿。它们既无法显示成
+可读文字，也不参与任何排序，只会让「主题 0 个 / 热度 18 条」看起来自相矛盾。
+
+**约定**：`lookup` 返回 `null` 表示「盘上没有这个 id」；返回对象（哪怕 `body` 为空）
+表示「存在，只是没写正文」。两者**不能用同一个 falsy 判断**，否则空条目会被误删。
+
+**b) 正文回填**：条目级行带 `preview`（正文首行截断，默认 40 字）与 `full`
+（完整正文，上限 400 字供悬停）。没有它们时面板只能显示一串十六进制 id，主人认不出是哪条。
+
+**c) 不在 `usage.json` 里真删孤儿**：只在展示层过滤。理由是条目可能临时不在盘上
+（切人设、项目目录移动），真删会把还能复用的热度丢掉。过滤是只读操作，零风险。
+
+**d) 布局**：热度表 `max-height: 132px` + 内部滚动 + 表头 sticky，条目列 `text-overflow: ellipsis`。
+18 行原本会把项目记忆正文挤成一条缝。
+
+**e) 表头用词**：标题从「主题热度」改为「记忆热度」。主题行只在整理器建过主题表之后才出现，
+在那之前每一行都是具体条目——叫「主题热度」会让「主题 0 个却有 18 行」看起来像 bug。
+
+### V12.10 本轮踩到的坑（必读）
+
+**「功能写了但没接线」比「功能写错」更难发现。** v12 首版实现了 `entryRows`（条目级热度）
+并写进了测试，却从没被任何调用方使用——因为 `tiering.heat` 只接了 `topicUsage`（主题级）。
+而主题级数据只有在整理器建过主题表之后才存在，于是面板永远空白、API 也从不报错。
+症状是「看起来像没做」，实际是接了一半的数据源。
+
+**判据：新增一个纯函数后，必须能指出它在生产链路里的调用点。** 只写测试不算接线。
+本条对应的回归用例在 `test/routes-doc-tiering.test.js` 的「两级热度」一组。
