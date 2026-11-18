@@ -114,6 +114,7 @@
     "personaCreate": "Create",
     "personaCancel": "Cancel",
     "personaCreateFailed": "Could not create persona: {error}",
+    "personaSwitchFailed": "Could not switch persona: {error}",
     "personaSwitched": "Persona switched.",
     "personaRename": "Rename",
     "personaRenamed": "Persona renamed.",

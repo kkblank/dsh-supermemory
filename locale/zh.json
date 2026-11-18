@@ -114,6 +114,7 @@
     "personaCreate": "创建",
     "personaCancel": "取消",
     "personaCreateFailed": "创建人设失败：{error}",
+    "personaSwitchFailed": "切换人设失败：{error}",
     "personaSwitched": "已切换人设。",
     "personaRename": "重命名",
     "personaRenamed": "已重命名人设。",
