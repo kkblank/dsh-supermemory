@@ -3146,7 +3146,7 @@ surface 上」也判成需要补偿，于是白写一条 `replace` 事件——�
 
 用户只跟「主管人格」对话；主管在系统提示里看到专家目录，用 `delegate_expert` 工具把专业活
 **同步**交给某个专家人格，拿到结论当轮汇报。专家子会话拿到**完整记忆**（soul / user /
-global / project），并且不能再委派（但可以起普通子代理）。
+global / project），并且不能再委派（但可以起普通子代理，部署前提见 §V13.11）。
 
 ### V13.1 数据模型
 
@@ -3221,7 +3221,8 @@ childId = randomUUID()
 - `order: 110`（排在 `supermemory:persona` 的 100 之后），`interpolate: false`，**同步** `text` 回调。
 - 出现条件（全部满足）：`delegateEnabled !== false`、插件软开关开启、
   `memoryInjection(agent) === 'full'`、当前生效人设 === 主管、非子智能体、至少一个非主管人设。
-- 输出：`## 专家人格` + 每个专家一行 `- 名称（专长）`（无专长只写名称）+ 一行工具用法说明。
+- 输出：`## 专家人格` + 每个专家一行 `- 名称（专长）`（无专长只写名称）+ `EXPERT_DIRECTORY_HINT`
+  两行工具用法说明（§V13.11）。
 - 预算 `expertDirectoryMaxBytes`（默认 2048）：超预算按条目从尾部丢弃，末尾加
   「另有 N 个专家未列出」；连标题都放不下则返回空串。
 - `subagents` 服务或 provider 缺失时，**工具与目录一起消失**——只给目录不给工具会让模型
@@ -3457,8 +3458,121 @@ payload 是 `{ ...runInfo, stopReason, lastAssistantMessage }`。
    （不同 childId 可以并行），但同一会话同一时刻只该跑一轮——并发续用同一 `sessionId` 不是
    有意义的用法，宿主会把它排进同一个会话的收件箱。
 
+### V13.11 专家目录里的两个「交活」工具（`EXPERT_DIRECTORY_HINT`）
+
+**目标**：`lib/core/experts.js` 的 `EXPERT_DIRECTORY_HINT` 是专家目录（§V13.4）末尾固定追加的
+两句话，负责说清宿主同时提供的两种「把活交出去」的方式——`delegate_expert` 交给专家人格，
+`subagent` 开主管自己的分身。目录本身只回答「有哪些专家」，这两句回答「什么时候该用哪个」。
+
+注入的原文：
+
+> 需要**专长判断**时，用 `delegate_expert`，`persona` 传上面的名称；专家带自己的记忆与专长干活，只执行你交代的任务，不会替你向用户汇报。
+> 只是**机械性的并行工作**（批量改文件、跑测试、搜资料、重复劳动）时，用 `subagent` 开自己的分身更轻量——分身用你自己的人格、看不到你与用户的对话，所以任务必须拆解完整、指令写清楚，别写「接着刚才那个改」。
+
+#### 两个工具的差别
+
+| | `delegate_expert` | `subagent`（spawn） |
+|---|---|---|
+| 用谁的人格 | 专家自己的 | 主管自己的 |
+| 带什么记忆 | 专家的人格 / 画像 / 全局 / 项目记忆 | 无（零上下文） |
+| 能看到主管的对话吗 | 看不到（只给 `task`） | 看不到（spawn 不继承上下文） |
+| 成本 | 高（绑人设 + 注入完整记忆） | 低（无绑定、无记忆注入） |
+| 适用 | 需要专长判断 | 机械性并行劳动 |
+
+**为什么必须两个都写**：只提一个必然退化，而且是两个方向相反的退化。
+
+- **只提 `delegate_expert`**：主管会把机械活也派给专家——批量改文件、跑测试这种活本不需要
+  任何人设，却白付了「绑人设 + 注入完整记忆」的成本，还占掉一个专家子会话。
+- **只提 `subagent`**：主管会把专业活留给自己干，或者开个分身硬干——专家的专长与记忆一条都
+  没用上，等于专家白设。
+
+这两句不是「补充说明」，是**让两个工具各自被用在它划算的地方**的唯一提示。目录里列了专家的
+名字，模型知道「有专家可用」，但不知道「什么时候不该用专家」——后者只能靠这段写。
+
+#### 「任务必须拆解完整」为什么是必需的一句
+
+spawn 后端的分身**看不到主管与用户的对话**，只拿到调用时给的那段 `prompt`
+（`inheritsParentContext = false`）。不强调这点，主管会写「接着刚才那个改」，分身完全不知道
+「刚才那个」指什么，只能瞎猜或反问，一次委派就废了。
+
+这是 spawn 与 fork 的本质区别：fork 后端的子代理会拿到主管已完成轮次的对话前缀
+（`inheritsParentContext = true`），所以 fork 的提示词里可以写「接着上面的改」；spawn 不行。
+本插件的专家目录只提示 spawn 的用法，因此这句话必须随提示一起给。
+
+#### 部署前提：`maxDepth` 必须 ≥ 2
+
+宿主按 `delegationDepth` 计层（`delegationDepthOf`：会话头 `delegationDepth` 与运行时
+`options.subagentDepth` 取较大值，缺失视为 0）：
+
+| 角色 | depth |
+|---|---|
+| 主管（根会话） | 0 |
+| 专家（`delegate_expert` 起的子会话） | 1 |
+| 专家的分身（专家调 `subagent`） | 2 |
+
+校验规则是 `resolveChildDepth(parent, maxDepth)`：`childDepth = delegationDepthOf(parent) + 1`，
+`childDepth > maxDepth` 时抛 `SubagentDepthError`（`name = 'SubagentDepthError'`，消息形如
+`subagent depth 2 exceeds maxDepth 1`）。
+
+所以要让专家能开分身，`subagent` 条目（`@deepseek-ai/dsh-subagent`）的 `maxDepth` 必须 **≥ 2**。
+它的默认值是 **1**（`Config` 里 `maxDepth: z.number().step(1).min(0).max(MAX_SAFE_INTEGER).default(1)`），
+**默认值下专家开分身会失败**，必须手动调。
+
+```yaml
+- id: subagent
+  name: '@deepseek-ai/dsh-subagent'
+  config:
+    maxDepth: 2
+```
+
+**超过深度上限时宿主不隐藏工具，而是注入提示词。** `tool-subagent` 注册了一条
+`systemPrompt.context`（`tool:<工具名>:depth`）：当调用方 `depth >= maxDepth` 时注入
+「`Delegation depth for subagent: current 1, maximum 1, remaining levels 0. Do not call subagent at
+this depth; carry out the work directly.`」，工具本身仍然注册、仍然可见。也就是说 `maxDepth: 1`
+下专家的症状不是「看不到 subagent 工具」，而是「看得到、被劝退，真调则抛 `SubagentDepthError`」。
+排障时别去找「工具为什么没注册」，要去看 `maxDepth`。
+
+**`delegate_expert` 本身不受这个上限约束**：工具构造的 spec（`lib/host/tools-expert.js`）只有
+`provider / childId / prompt / parent / cwd / label / signal / delivery`，**不带 `maxDepth`**，
+所以宿主对「主管 → 专家」这一层不做上限校验。受 `maxDepth` 影响的只有「专家 → 分身」。
+反过来也要知道：`maxDepth` 是服务级配置，调大后对整棵树里所有 delegation 工具生效，不只放宽
+专家那一层。
+
+#### 需要同时启用 `tool-subagent`
+
+| 条目 | 是否必须 | 理由 |
+|---|---|---|
+| `tool-subagent`（`@deepseek-ai/dsh-tool-subagent`，`provider: spawn`） | **必须 enabled** | 专家只有拿到这个工具才能开分身 |
+| `tool-subagent-fork`（同包，`provider: fork`） | **不要求** | fork 后端 `inheritsParentContext = true`，会把主管已完成轮次复制给子代理，token 成本高，且子代理能看到全部对话内容 |
+
+fork 那条与本插件的口径是冲突的：专家子会话的记忆边界是「只有自己的记忆 + 主管给的 task」，
+fork 出来的子代理却能读到主管的整段对话。所以本插件不要求、也不建议为专家开分身而启用 fork。
+
+#### 本插件自身不依赖 `subagent` 工具
+
+`delegate_expert` 直接调 `ctx.subagents.startActivation`（续用路径调 `subagents.sendMessage`，
+§V13.10），**不经过任何 delegation 工具**。所以 `tool-subagent` 被禁用时，主管委派专家仍然
+可用——受影响的只是「专家能不能再开分身」。
+
+同理，专家调不到 `delegate_expert` 是插件自己的门控（`admitted()` 要求
+`isSubagent(agent) !== true`，注册与执行共用同一条判据），与 `tool-subagent` 是否启用无关。
+
+§V13.8「明确不做」里的「多层委派」指**人格委派链**（专家不能再 `delegate_expert` 委派另一个人格），
+不含本节说的「专家开普通分身」——后者是被支持的，前提是 `maxDepth ≥ 2`。
+
+#### 已知限制
+
+1. **分身按普通子代理判定，不注入记忆**：分身没有 `sessionPersonas` 绑定，`memoryInjection`
+   判为 `none`（§V13.2 用「有绑定」认专家，普通子代理走 `injectIntoSubagents`，默认 false）。
+   分身既没有人格 section 也没有记忆快照——这正是它「轻量」的来源，但也意味着分身不知道任何
+   项目约定，指令必须自包含。
+2. **`maxDepth` 是全局旋钮，不是专家专属开关**：调大它对整棵树的委派都生效。
+3. **深度超限不会静默降级**：工具被劝退后若仍被调用，`startActivation` 直接抛
+   `SubagentDepthError`，这一轮委派失败，不会自动改用「自己干」。
+
 ### V13.8 明确不做
 
-专家模型覆盖、专家工具白名单、多层委派（专家不能再委派）、DSH agent preset 改动、
+专家模型覆盖、专家工具白名单、人格委派链（专家不能再 `delegate_expert`；开普通分身不受限，
+见 §V13.11）、DSH agent preset 改动、
 会话内委派卡片、专家记忆独立存储（项目记忆按项目根走，不按人设）、
 会话自动复用与自动过期（§V13.10：由主管显式传 `sessionId` 覆盖）。
