@@ -3229,7 +3229,8 @@ childId = randomUUID()
 
 ### V13.5 委派工具 `delegate_expert`（`lib/host/tools-expert.js`）
 
-参数 `{ persona, task, label? }`，`additionalProperties: false`。
+参数 `{ persona, task, label?, sessionId? }`，`additionalProperties: false`。
+`sessionId` 续用已有专家会话（§V13.10）；省略即新起。
 
 注册门控（两道，都要）：`tools.register(def, { when })` + `execute` 内再判一次：
 `isSubagent(agent) !== true && isSupervisorAgent(agent) === true`。
@@ -3240,8 +3241,10 @@ childId = randomUUID()
 执行要点：
 1. 顺序校验：插件开关 → `delegateEnabled` → `exec.agent` → 非子代理 → 是主管 → 参数合法性
    → 专家存在且不是主管自己 → `subagents` 服务可用。
-2. `childId = randomUUID()`（满足 `checkSessionId` 白名单）。
+2. `childId`：未传 `sessionId` → `randomUUID()`（满足 `checkSessionId` 白名单）；传了 → 用它，
+   并先过 `checkSessionId` 与「同一专家」校验（§V13.10）。
 3. **先绑定后起 agent**（V13.3）；绑定失败 → `DELEGATE_BIND_FAILED`，不起 agent、不写记录。
+   续用时绑定已存在，不重复写盘。
 4. `delivery: 'caller'`：结果只回给调用方，不额外向父会话注入消息（同步等待模式）。
 5. `cwd` 取父 agent 当前目录，保证专家指向同一份项目记忆。
 6. `stopReason` 映射：`completed` → `ok:true`；`aborted` → `CANCELLED`；
@@ -3297,7 +3300,165 @@ childId = randomUUID()
 「好的，已记录」然后什么都不做。本项目在 v12 踩过同类空承诺，故提示里给的是
 可直接照抄的调用形态，而不是一句劝告。
 
+### V13.10 续用专家会话（`sessionId`）
+
+**目标**：同一件事的后续委派，主管传上一次返回的 `sessionId`，续用那个专家子会话——专家保留
+已读过的文件与中间结论，不必再读一遍。**什么时候该续、什么时候该新起，由主管自己判断**，
+工具不猜（见本节「为什么不做自动复用」）。
+
+#### 参数与返回
+
+| 位置 | 键 | 类型 | 语义 |
+|---|---|---|---|
+| 入参 | `sessionId` | string（可选） | 省略 = 新起一个会话；传上次返回的 id = 续用 |
+| 返回 | `sessionId` | string | 本次专家会话的 id |
+| 返回 | `continued` | boolean | 本次是续用（`true`）还是新起（`false`） |
+
+**回带范围分三档，别记成「失败就一定有」**：
+
+| 出口 | `sessionId` | `continued` |
+|---|---|---|
+| `finish()`（结论映射，成功与 `stopReason` 失败） | 有 | 有 |
+| 会话已定 id 之后的基础设施失败：`sendMessage` 抛错 / 未返回凭证 / 投递前已取消 / `waitForEnd` 取消、`activation.result` reject | 有 | 有 |
+| 会话还没定 id 的早退：开关、门控、参数、`NOT_FOUND`、`sessionId` 非法、人设不匹配、`sendMessage` 缺失、`subagent/end` 监听不可用、`DELEGATE_BIND_FAILED` | 无 | 无 |
+| `startActivation` 抛错 | 无 | 无（会话没建成，该分支同时回滚绑定） |
+
+- **`sessionId` 在失败时也回带**，因为主管可以拿它续上这次没干完的会话，而不是从头再来一遍；
+  第二档正是「会话已存在但这一轮没跑成」，所以仍然可续。
+- **`continued` 同样贯穿第二档**：主管靠它区分「我续的会话失败了」与「我新起的会话失败了」，
+  两者下一步动作完全不同（前者可以再续，后者只能重来）。续用路径的失败出口统一经
+  `failContinued()` 产出，不在各处手写。
+- 两个键都写进了 `OUTPUT_SCHEMA`：宿主严格校验输出，漏声明一个键整个调用判非法（§V13.5）。
+
+#### 两条执行路径
+
+| | 新起（无 `sessionId`） | 续用（有 `sessionId`） |
+|---|---|---|
+| 会话 id | `randomUUID()`（满足 `checkSessionId` 白名单） | 直接用传入的 `sessionId` |
+| 人设绑定 | 先 `sessionPersonas.set`，失败 → `DELEGATE_BIND_FAILED` | **不重复绑定**，只校验与目标专家一致 |
+| 起会话 | `subagents.startActivation(spec)` | `subagents.sendMessage(agent, childId, …, { signal })` |
+| 拿结果 | `await activation.result` | 等 `subagent/end` 事件，靠 `info.id` 匹配 |
+| 上下文 | 全新 | 保留上一轮（已读文件、中间结论） |
+| 结果映射 | 共用 `finish()` | 共用 `finish()` |
+
+**为什么两条路径共用 `finish()`**：结果语义（截断、`stopReason` → 错误码、写记录、回带
+`sessionId`/`continued`）必须是一套；分成两份必然漂移，本项目在 v10 吃过「两处判据漂移」的亏。
+这里只让「怎么拿到结果」不同，「怎么解释结果」共用。
+
+**续用省的不是「记忆注入」，是「重复读取」**。人格 section 与 pre-step 记忆快照每轮都照常
+执行（§V13.2 / §V8.1.1 的注入时机与委派方式无关），续用的专家一样会拿到当轮最新记忆。省下的
+是**上一轮已经读进上下文的文件内容与中间结论**——那些东西留在会话日志里，冷恢复后原样回放，
+专家不必再读一遍文件、也不必重新推理到同一个中间状态。
+
+**续用不传 `cwd`**：`sendMessage` 的签名是 `(sender, targetId, content, { signal })`，没有目录
+参数，冷恢复沿用会话原有的工作目录。所以续用期间主管若换了工作目录，专家仍在旧目录里干活
+（新起路径的 `cwd` 由 `resolveCwd(agent)` 取调用方当前目录）。
+
+#### 为什么续用必须走 `sendMessage`
+
+宿主的 `startActivation` 明确拒绝复用已有 childId：`startLocalNamed` 先
+`assertChildIdAvailable(childId)`，`resident` / `agents.get` / `sessions.get` 任一命中即抛
+`SubagentError('subagent "…" already exists', 'DUPLICATE_CHILD')`；带 `spec.childId` 时还会查
+一次持久化痕迹，有痕迹同样拒绝（`spawn` 是 local 后端，走的就是这条）。
+`startActivation` 只接受一个**尚未存在**的 childId，没有「续用」这个入参。
+
+`sendMessage` 才是「向已存在的子会话投递」的原生入口：`deliverToMember` 发现目标不在 resident
+时走 `restoreTarget` → `agents.resume({ resumeSessionId })`，即**自动冷恢复**（前提是该会话的
+descriptor 是 `continuable`，`spawn` 后端满足；否则报 `NOT_RESUMABLE`）。这个前提不靠猜：上一轮
+结束（`finishDisposal` 的 `resident.delete`）后子会话就离开 resident 了，所以续用**实际上总是**
+走冷恢复那一支——「目标仍在线」只是工具并发调用同一会话时才可能出现的短暂情形。
+
+冷恢复还有两个宿主侧硬依赖，缺了会直接失败而不是降级：`sessionQuery` 服务（缺失报
+`CONTINUATION_UNAVAILABLE`，错误消息要求加载 `@deepseek-ai/dsh-session-query`）与创建时的
+subagent 目录记录（`subagentCatalog` 里找不到该条目报 `UNAUTHORIZED`）。
+
+代价：**`sendMessage` 只回投递凭证（`MessageId`），不回结论**。所以结论只能等
+`subagent/end` 全局生命周期事件。该事件每次 residency epoch 发一次（冷恢复也是一次新 epoch），
+payload 是 `{ ...runInfo, stopReason, lastAssistantMessage }`。
+
+`subagent/end.lastAssistantMessage` 与 `activation.result.output` 是**同一选取规则**
+（宿主 `assistant-output.js` 的 `finalAssistantOutput`：最后一条非空 assistant 消息，否则累积的
+流式文本），所以两条路径的结论语义一致。产出为空时该键缺席，按空结论处理（`text` 只剩提示）。
+
+#### 为什么不做自动复用
+
+**由主管自己判断，工具不猜。** 什么该续（同一件事的后续、需要沿用已读文件与中间结论）、
+什么该新起（换了话题、会话已跑偏或太长），只有主管掌握全部上下文，工具没有这个信息。
+
+自动复用会带来三个问题：
+
+1. **会话无限膨胀**：一路续下去，上下文迟早撞上限，且被截断的是主管看不到的专家内部历史。
+2. **跨话题污染**：上一个任务的结论会继续影响新任务，而主管很难察觉结论从哪来。
+3. **需要额外的过期 / 重建策略**：什么时候强制新起、旧会话留多久，都是启发式，复杂度高、
+   行为难预测。
+
+所以不做 `delegateReuseSessions` 这类自动开关，也不做过期策略——主管显式传 `sessionId`
+已经覆盖全部场景：想续就传，想新起就不传。
+
+#### 校验规则
+
+| 检查 | 失败码 |
+|---|---|
+| `checkSessionId`（`lib/core/session-personas.js` 的权威实现）：非空、≤200 字符、白名单 `[A-Za-z0-9._:-]`、无 NUL | `BAD_INPUT` |
+| 该会话绑定的人设与目标专家一致（读不到绑定 = 放行） | `BAD_INPUT` |
+| `subagents.sendMessage` 存在 | `DELEGATE_UNAVAILABLE` |
+| `subagent/end` 监听可用（`ctx.on` 存在且注册成功） | `DELEGATE_UNAVAILABLE` |
+
+- **复用 `checkSessionId`，不抄第二份判定**：§V8.12「单一来源纪律」——同一份判定只许有一处实现。
+  非法 id 必须在这里挡住，否则会一路传到宿主 `sendMessage` 才炸，报错信息还不如这里准确。
+- **刻意不 `trim`**：`checkSessionId` 的契约是「前后带空格说明调用方传错了」，悄悄修好只会掩盖
+  调用方的 bug（比如把展示文本当 id 传了）。只有空串才视为「不续」。
+- **续用必须仍指向同一个专家**：拿 A 专家的会话跑 B 专家的任务，等于让 B 顶着 A 的人格与
+  上下文干活，产出的结论没法解释，也没法追责。
+- **无绑定时放行**：读不到不等于不匹配，宁可能续上，也不能因为读盘失败把续用能力整个关掉。
+  代价见「已知限制」第 3 条。
+- **`subagent/end` 不可用要当场拒绝，不能静默继续**：缺监听时 `waitForEnd` 永远等不到 end，
+  症状是「委派卡死」且没有任何线索指向「事件监听没装上」。宁可返回 `DELEGATE_UNAVAILABLE`
+  把原因说清。这条只拦续用路径——新起路径不依赖该事件，照常可用。
+
+#### 等待与取消
+
+- `pendingEnds`：`childId → Set<waiter>` 登记表（`Map<string, Set>`）。`waitForEnd` 把自己加进
+  该 childId 的集合，`installEndListener` 在收到 `subagent/end` 时按 `info.id` 取出整组、先
+  `delete` 再逐个唤醒。
+- **同一 childId 允许多个等待者，一次 end 分发给全部**：同一个 childId 只对应一个会话，
+  `subagent/end` 就是那一轮的结束，所有在等它的人都该收到同一个结论。只唤醒最后一个会让先来的
+  那次工具调用白等到超时。
+- **摘除要比引用、不能整块 `delete`**：每个等待者从集合里删自己，删空了才删 key。旧等待者的
+  abort 若无条件 `delete(childId)`，会把新等待者的登记一起摘掉——新等待者永远收不到 end。
+- **三个清理点缺一不可**：收到 end 时、超时 / 取消时（`finish` 里摘自己并移除 abort 监听）、
+  插件卸载时。
+- **卸载必须唤醒所有等待者**：插件被禁用 / 重载后那些 Promise 永不 settle，主管的工具调用会
+  一直挂到宿主 `TOOL_TIMEOUT`（超时包装器只映射超时，不会替你 settle 工具内部的 Promise）。
+  dispose 里遍历所有集合，以 `{ id: '', stopReason: 'aborted' }` 逐个唤醒（`finish()` 映射为
+  `CANCELLED`），再 `clear()`，并拆掉 `subagent/end` 监听。
+- **`subagent/end` 不能见到就当自己的**：它是全局广播（本插件监听器不按子代理树 scope 过滤），
+  同一次委派期间别的子代理树也在发事件。必须靠 `info.id` 与登记的 childId 精确匹配，未命中
+  直接返回；否则会把别人的 `stopReason` 与 `lastAssistantMessage` 当成本次结论。
+
+#### 已知限制
+
+1. **硬前提是宿主提供 `subagent/end` 事件**（以及 `ctx.on` 可用）。缺了它续用能力不可用：
+   工具在参数校验阶段就返回 `DELEGATE_UNAVAILABLE`（不会让 `waitForEnd` 挂到超时）。
+   新起路径不依赖该事件，照常可用。
+2. **会话不会自动过期**。工具不设 TTL、不清理旧会话；主管需要自己判断何时该新起。
+3. **放行无绑定会话的代价**：续用一个读不到人设绑定的会话时，它不会被 `memoryInjection` 认作
+   专家子会话（§V13.2 用「有绑定」认专家），该轮按普通子代理判定——默认 `none`，即没有
+   人格 section 也没有记忆快照。
+4. **续用路径没有 `diagnostic`**：`subagent/end` 只带 `stopReason` 与 `lastAssistantMessage`，
+   所以失败消息没有括号补充（新起路径的 `activation.result` 有）。
+5. **取消只覆盖「等结果」这一段，不中止专家执行**：`sendMessage` 的 `signal` 契约是「只在
+   inbox 接受前拥有这次调用」，投递成功后就与它无关了；工具侧 `waitForEnd` 的 abort 只让本次
+   工具调用以 `CANCELLED` 收场，专家那一轮仍在跑（新起路径能靠 `activation.dispose()` 收尾，
+   续用路径没有可 dispose 的 activation）。这也是「续用失败不回滚任何东西」的另一面：绑定本来
+   就没动，会话保持冷态，下次还能续。
+6. **同一会话并发续用的语义是「都收到同一个结论」**：多等待者共享一次 `subagent/end`，两次
+   工具调用会拿到相同的 `lastAssistantMessage`。工具声明了 `isConcurrencySafe: () => true`
+   （不同 childId 可以并行），但同一会话同一时刻只该跑一轮——并发续用同一 `sessionId` 不是
+   有意义的用法，宿主会把它排进同一个会话的收件箱。
+
 ### V13.8 明确不做
 
 专家模型覆盖、专家工具白名单、多层委派（专家不能再委派）、DSH agent preset 改动、
-会话内委派卡片、专家记忆独立存储（项目记忆按项目根走，不按人设）。
+会话内委派卡片、专家记忆独立存储（项目记忆按项目根走，不按人设）、
+会话自动复用与自动过期（§V13.10：由主管显式传 `sessionId` 覆盖）。
