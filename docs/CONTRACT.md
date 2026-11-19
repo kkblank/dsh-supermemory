@@ -3570,6 +3570,52 @@ fork 出来的子代理却能读到主管的整段对话。所以本插件不要
 3. **深度超限不会静默降级**：工具被劝退后若仍被调用，`startActivation` 直接抛
    `SubagentDepthError`，这一轮委派失败，不会自动改用「自己干」。
 
+### V13.12 能力提示必须由实测生成（部署体检）
+
+**问题形态**：提示词里「声明某项能力存在」的句子，如果是**写死的静态文本**，就会与
+实际部署脱节。本插件踩过：`EXPERT_DIRECTORY_HINT` 原本只写 `delegate_expert`，
+后来补上 `subagent` 那句——但若宿主 `tool-subagent` 被禁用，这句立刻变成假话，
+模型照着去调 `subagent` 然后失败，且**没有任何提示**。反过来，只写一个工具也会让
+模型用错工具（机械活派给专家 / 专业活自己干）。
+
+**根因不是「忘了写全」，而是「提示词不随环境变化」**。所以修法不是再补一句文案，
+而是把可变部分改成**运行时推导**。
+
+#### 注入侧：三态输出
+
+`buildExpertDirectory({ …, canSpawn })` 的 `canSpawn` 由
+`tools.get('subagent', scope)` 实测得到（宿主 `section.text(context)` 提供 `scope`）：
+
+| `canSpawn` | 目录末尾输出 | 触发条件 |
+|---|---|---|
+| `true` | `EXPERT_SPAWN_HINT`：分工说明 + 「任务必须拆解完整」 | 工具对当前 scope 可见 |
+| `false` | `EXPERT_SPAWN_MISSING_HINT`：如实说不可用 + 该启用什么、`maxDepth` 要多少 | 工具不可见 |
+| `undefined` | **不输出这一句** | `tools` 服务缺失 / `scope` 缺失 / 查询抛错 |
+
+`EXPERT_DELEGATE_HINT`（委派专家那句）**三态恒在**：它不依赖部署，永远成立。
+
+**为什么 `undefined` 时什么都不说**：检测不到就断言「不可用」可能是错的，断言「可用」
+更可能是错的。提示词只陈述**能被验证的事实**——少说一句的代价，远小于说错一句让模型
+按错误前提行动。
+
+**为什么不用「不带 scope 的全局查询」**：`tools.get(name)` 省略 scope 查的是全局视图，
+会忽略按 agent 的可见性覆盖，结论可能与当前会话不一致。scope 缺失时宁可返回 `undefined`。
+
+#### 启动侧：一条日志
+
+`reportSpawnCapability(ctx, logger)` 在装配时用**全局视图**查一次 `subagent`，
+缺失则 `logger.warn` 一条，说明「专家无法开分身」以及如何恢复。
+
+**为什么只写日志、不改行为**：这是**观测**不是门控。禁用 `tool-subagent` 时主管委派专家
+仍然可用（§V13.11：`delegate_expert` 不经过该工具），所以这里绝不能阻断任何功能。
+服务缺失（非本形态宿主）时静默返回，不产生噪声。
+
+#### 兼容性
+
+`EXPERT_DIRECTORY_HINT` 保留为 `EXPERT_DELEGATE_HINT` 的别名，但它**不再包含**
+`subagent` 那句。任何按旧文案断言「末尾必须是分工说明」的测试都要改成
+`canSpawn: true` 显式传入——默认（不传）是 `undefined` 态，不输出该句。
+
 ### V13.8 明确不做
 
 专家模型覆盖、专家工具白名单、人格委派链（专家不能再 `delegate_expert`；开普通分身不受限，
