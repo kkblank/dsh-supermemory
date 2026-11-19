@@ -50,3 +50,26 @@
         digestTier3MinEntries: 60
         digestTier2BatchTopics: 5
         digestTier3BatchTopics: 8
+        # ——— 主管 / 专家人格委派（契约 §V13）———
+        # 用户只跟「主管」对话；主管看到专家目录后，用 delegate_expert 工具把专业活
+        # 同步交给某个专家人格，拿到结论当轮汇报。谁是主管、每个专家的专长是**用户数据**，
+        # 存在 personas.json 里由面板编辑，不在这里配；下面只是运维旋钮。
+        delegateEnabled: true
+        # 子 agent 后端名；dsh-base 注册的是 in-process spawn（零父对话上下文）。
+        delegateProvider: spawn
+        # 同步等待模式下工具会阻塞到专家跑完，故声明 timeoutMs 交给宿主 timeout-policy 兜底。
+        delegateTimeoutMs: 900000
+        # 专家结论回传给主管的字节上限，超出截断并加一行提示。
+        delegateResultMaxBytes: 16000
+        # 专家人格目录（系统提示里那一小段）的注入预算。
+        expertDirectoryMaxBytes: 2048
+        # 专家子会话是否注入**完整**记忆（soul + user + global + project）。
+        # 与 injectIntoSubagents 是两个键：那个管普通子代理（默认 false），这个管专家
+        # （默认 true——没有专长相关记忆的专家等于白请）。
+        injectIntoExpertSubagents: true
+        # delegations.jsonl 保留行数，超出后重写只留最新。
+        delegateLogKeep: 200
+        # 委派成功后，在结论末尾追加一段「记忆沉淀」提示，让主管自己判断要不要把
+        # 专家的有用结论写进项目记忆。**只提示、不代写**：专家子会话不触发自动整理
+        # （整理只在主会话 turn/end 跑，且硬编码只写 project），所以专家产出默认不会沉淀。
+        delegatePersistHint: true

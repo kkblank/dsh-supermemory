@@ -3139,3 +3139,165 @@ surface 上」也判成需要补偿，于是白写一条 `replace` 事件——�
 
 **判据：新增一个纯函数后，必须能指出它在生产链路里的调用点。** 只写测试不算接线。
 本条对应的回归用例在 `test/routes-doc-tiering.test.js` 的「两级热度」一组。
+
+---
+
+## V13 主管 / 专家人格自动委派（v13）
+
+用户只跟「主管人格」对话；主管在系统提示里看到专家目录，用 `delegate_expert` 工具把专业活
+**同步**交给某个专家人格，拿到结论当轮汇报。专家子会话拿到**完整记忆**（soul / user /
+global / project），并且不能再委派（但可以起普通子代理）。
+
+### V13.1 数据模型
+
+**`personas.json` 条目新增两个可选字段**（向后兼容，旧文件不迁移、不写回）：
+
+| 字段 | 类型 | 语义 |
+|---|---|---|
+| `supervisor` | boolean | 是否主管。**全表最多一个**；缺失时兜底 slug 为 `default` 的条目。 |
+| `expertise` | string | 专长描述，单行化、去首尾空白、按码点截断 500。仅用于专家目录展示。 |
+
+**委派记录 `$DSH_HOME/supermemory/delegations.jsonl`**（与 `personas/`、
+`session-personas.json` 平级）：
+
+```json
+{"at":"...","supervisor":"default","persona":"财务分析师","sessionId":"<uuid>","label":"...","ok":true,"stopReason":"completed","durationMs":12345,"taskPreview":"...","resultPreview":"..."}
+```
+
+预览各截 200 字符。超过 `delegateLogKeep`（默认 200）行时重写只留最新。
+
+**两个数字是两套口径，不要合并**：
+- `delegateLogKeep`（200）= **文件保留行数**，运维旋钮，配在 `cordis.patch.yml`；
+- 路由的 `RECENT_LIMIT`（50）= **面板展示条数**，产品口径，写死在 `routes-experts.js`。
+
+面板只看最近 50 条，但文件要留更长的历史供排障——把两者改成同一个数，要么面板一次吐出 200 行，
+要么排障时只剩 50 条。
+
+**写队列按文件路径共享**（`delegations.js` 模块级 Map，不是每个实例一个）：装配层与
+`delegate_expert` 工具各持一个实例读写同一个文件，各持队列时「A 读 40 行 → B 追加 → A 写回旧快照」
+会静默吞掉 B 那条。回归用例是 40 条两实例交叉并发断言无覆盖。
+
+**专家识别口径**：所有非主管人设都算专家。`supervisor` 只标记「谁是主管」，
+**不标记谁是专家**——这样用户新建一个人设就等于多了一个专家，不需要额外动作。
+
+### V13.2 `memoryInjection` 三档判定（`lib/index.js`）
+
+**单一判定入口**。人格 section 与 pre-step 快照都只调它，绝不各自再写一份条件——
+v10 已经吃过「两处判据漂移」的亏（人格 section 漏判子智能体，门控只在一半生效）。
+
+| 条件 | 结果 |
+|---|---|
+| 插件软开关关闭 | `none` |
+| 非子智能体 | `full` |
+| 子智能体 + 该会话**有**人设绑定（= 专家子会话） | `injectIntoExpertSubagents`（默认 true）→ `full` |
+| 子智能体 + **无**绑定（= 普通子代理） | `injectIntoSubagents`（默认 false）→ `none` |
+
+`full` = 人格 section + 记忆快照都注入；`none` = 两者都不注入。
+
+**为什么用「有绑定」认专家**：委派工具在起子 agent **之前**就写好绑定（V13.3），
+所以子 agent 一出生 `get()` 就能读到；而父会话链在冷恢复后未必还在，绑定才是耐久事实。
+
+**降级**：`deps.memoryInjection` 缺失时（老 mock / 单测）注入层退回旧判据
+`config.injectIntoSubagents === false && isSubagent → none`，保证既有测试语义不变。
+
+### V13.3 委派时序铁律（顺序不能换）
+
+```
+childId = randomUUID()
+→ await sessionPersonas.set(childId, 专家slug)   // 先绑定
+→ startActivation({ childId, ..., delivery: 'caller' })   // 后起 agent
+→ await result → finally dispose()
+```
+
+反过来的后果：`agent/created` 的预热监听按**全局主管人设**预热，专家第一轮人格是主管的
+——正是 v10 那类串台事故。
+
+绑定**不**在子会话结束后清理：DSH 子代理可冷恢复（`send_message` 唤醒），清了会让专家
+丢失人格。只在人设被删时由现有 `removePersona` 清理僵尸绑定。
+**唯一例外**：`startActivation` 抛错时必须回滚绑定，否则每次失败都留一条永久僵尸。
+
+### V13.4 专家目录 section（`supermemory:experts`）
+
+- `order: 110`（排在 `supermemory:persona` 的 100 之后），`interpolate: false`，**同步** `text` 回调。
+- 出现条件（全部满足）：`delegateEnabled !== false`、插件软开关开启、
+  `memoryInjection(agent) === 'full'`、当前生效人设 === 主管、非子智能体、至少一个非主管人设。
+- 输出：`## 专家人格` + 每个专家一行 `- 名称（专长）`（无专长只写名称）+ 一行工具用法说明。
+- 预算 `expertDirectoryMaxBytes`（默认 2048）：超预算按条目从尾部丢弃，末尾加
+  「另有 N 个专家未列出」；连标题都放不下则返回空串。
+- `subagents` 服务或 provider 缺失时，**工具与目录一起消失**——只给目录不给工具会让模型
+  调用一个不存在的工具。
+
+### V13.5 委派工具 `delegate_expert`（`lib/host/tools-expert.js`）
+
+参数 `{ persona, task, label? }`，`additionalProperties: false`。
+
+注册门控（两道，都要）：`tools.register(def, { when })` + `execute` 内再判一次：
+`isSubagent(agent) !== true && isSupervisorAgent(agent) === true`。
+
+输出 schema 必须覆盖返回值的**每一个键**——宿主严格校验，漏一个整个调用判非法
+（本项目 `memory` 工具在 v8 踩过 `score` 漏声明）。
+
+执行要点：
+1. 顺序校验：插件开关 → `delegateEnabled` → `exec.agent` → 非子代理 → 是主管 → 参数合法性
+   → 专家存在且不是主管自己 → `subagents` 服务可用。
+2. `childId = randomUUID()`（满足 `checkSessionId` 白名单）。
+3. **先绑定后起 agent**（V13.3）；绑定失败 → `DELEGATE_BIND_FAILED`，不起 agent、不写记录。
+4. `delivery: 'caller'`：结果只回给调用方，不额外向父会话注入消息（同步等待模式）。
+5. `cwd` 取父 agent 当前目录，保证专家指向同一份项目记忆。
+6. `stopReason` 映射：`completed` → `ok:true`；`aborted` → `CANCELLED`；
+   `max-tokens` → `MAX_TOKENS`；`refusal` → `REFUSAL`；其余 → `DELEGATE_FAILED`。
+7. 结论按 `delegateResultMaxBytes` 截断并置 `truncated: true`。
+8. 起 agent 抛错 → 回滚绑定 + `DELEGATE_FAILED`。
+9. 无论成败写一条委派记录（写失败只 warn，不影响返回值）。
+
+### V13.6 路由（`lib/host/routes-experts.js`）
+
+`GET|HEAD api/dsh-supermemory/experts` → `{ supervisor, personas, recent }`；
+`PUT` → `{ supervisor? }` / `{ slug, expertise }` / 两者同传，成功后返回与 GET 同构的 data。
+
+错误映射：`BAD_INPUT`→400、`NOT_FOUND`→404（对外码 `PERSONA_NOT_FOUND`）、其余→500、
+`deps.experts` 缺失→503 `EXPERTS_UNAVAILABLE`。**不做 `pluginEnabled()` 拦截**
+（与人设三件套同口径：关掉插件后用户仍要能改主管与专长）。
+
+### V13.7 配置（只从 `cordis.patch.yml` 读，不进 settings.json / 面板）
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `delegateEnabled` | `true` | 委派总开关 |
+| `delegateProvider` | `'spawn'` | 子 agent 后端名 |
+| `delegateTimeoutMs` | `900000` | 工具超时预算 |
+| `delegateResultMaxBytes` | `16000` | 结论返回上限 |
+| `expertDirectoryMaxBytes` | `2048` | 专家目录注入预算 |
+| `injectIntoExpertSubagents` | `true` | 专家子会话是否注入完整记忆 |
+| `delegateLogKeep` | `200` | 委派记录保留行数 |
+| `delegatePersistHint` | `true` | 委派成功后是否追加记忆沉淀提示（只提示不代写，§V13.9） |
+
+### V13.9 委派后的记忆沉淀提示
+
+**背景（既有事实，不是缺陷）**：自动整理只在**主会话**的 `turn/end` 触发，
+`digest.js` 的 `shouldConsider` 明确排除 `parentSession` 与 `origin === 'subagent'`；
+且可写范围被 `HARD_WRITABLE_SCOPES` 硬编码为 `project`。
+所以专家子会话干完活，它那轮产出**不会**被自动沉淀。
+
+**做法**：委派**成功**时，在工具返回的 `text` 末尾追加一段 `[记忆沉淀]` 提示，
+写清该调什么工具、传什么参数（`memory` + `action="append"` + `scope="project"`），
+并明确「只是这次任务的一次性结果就不要写」。
+
+**四条约束**：
+
+1. **只提示，不代写**。「什么值得沉淀」是判断而非规则；自动写会把握手、闲聊、
+   一次性计算结果一起灌进记忆，反而把重要内容挤进冷层。
+2. **不计入 `delegateResultMaxBytes`**。该预算是给专家正文的；提示是工具追加的元指令，
+   让它去抢正文预算会导致「结论被截断只为放下一段提示」。
+3. **不进委派记录**。`resultPreview` 必须只反映专家说了什么，混入元指令会让面板与
+   排障都失真。
+4. **可关**：配置 `delegatePersistHint: false`（默认 true）退回「只回专家正文」。
+
+**为什么提示必须写清工具与参数**：只说「记得沉淀」等于没说——模型会回一句
+「好的，已记录」然后什么都不做。本项目在 v12 踩过同类空承诺，故提示里给的是
+可直接照抄的调用形态，而不是一句劝告。
+
+### V13.8 明确不做
+
+专家模型覆盖、专家工具白名单、多层委派（专家不能再委派）、DSH agent preset 改动、
+会话内委派卡片、专家记忆独立存储（项目记忆按项目根走，不按人设）。
