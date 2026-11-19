@@ -3622,3 +3622,196 @@ fork 出来的子代理却能读到主管的整段对话。所以本插件不要
 见 §V13.11）、DSH agent preset 改动、
 会话内委派卡片、专家记忆独立存储（项目记忆按项目根走，不按人设）、
 会话自动复用与自动过期（§V13.10：由主管显式传 `sessionId` 覆盖）。
+
+---
+
+## V14 注入与存储的三处实证修复（v14）
+
+本节优先于前文，冲突处以本节为准。三项均来自 `A 类自省审查` 的实证结论，改动只收敛缺陷，
+不调整任何预算、不压缩任何注入文本。
+
+### V14.1 预取的输入来源改为 `agent/pre-step` 的 `payload.messages`
+
+**推翻 §V8.9 首条「pre-step 从 `agent.session` 取最近一条 user 消息」。** 该判据在真实宿主上
+**永远拿不到本轮输入**：
+
+宿主 `dsh-agent-loop` 的时序是 `preStep()`（派发 `agent/pre-step`，payload 带
+`messages: claimed`）→ `step()` 里才 `session.append('user/message', ...)` 落盘。插件被调用时
+日志里没有本轮发言，`scanSessionLog` 的 `userQuery` 要么是 null（首轮），要么是**上一轮**的
+输入——用旧 query 检索，捞回来的是上一个话题的冷层条目。实测 61 个真实会话、71 条本插件
+快照事件：pre-step 精确时刻 **71/71 拿不到本轮输入**。
+
+定稿取值优先级：
+
+1. **`payload.messages` 里最后一条 `source.kind === 'user'` 的消息**（主来源）；
+2. `scanSessionLog(session).userQuery`（降级：旧宿主、测试夹具不传 `messages`）；
+3. 两者都没有 → 本轮按「没有输入」处理，`recallSkipReason` 记 `no-query`。
+
+**两种形态必须都认，且提取口径逐字一致**（`lib/host/inject-recall.js` 的
+`textOfContent` 是唯一实现）：
+
+| 来源 | 形态 | 读法 |
+|---|---|---|
+| `payload.messages` | **消息对象** | 顶层 `message.source` / `message.content` |
+| `session.snapshotEvents()` | **事件对象** | `event.data.source` / `event.data.content` |
+
+提取规则：只收 `type === 'text'` 的片段，`join('\n')` 后**整体** `trim()`；不逐片段裁空白
+（改了会让同一句话算出不同的检索词，表现为「预取时好时坏」且无日志可见）。
+
+**新增导出**：`textOfContent(content)`、`userQueryFromPayload(messages)`、`MAX_LOOKBACK`。
+
+### V14.2 `MAX_LOOKBACK` 由 32 提到 256
+
+同一条实测证据：`tool/call` 4285 条、`tool/result` 4286 条，平均每会话约 140 条工具事件，
+**单轮 40+ 条非常常见**。取 32 会在长工具轮次上静默丢弃输入（`events.length - 1 - index < 32`
+不成立即返回 null），症状是「这一轮的预取又没出来」。
+
+取 256：覆盖实测最坏情形仍有余量，同时把单次回溯钉在有界常数上（O(256)，不随会话长度增长）。
+**该常量只许有一份**，`lib/host/inject.js` 与 `lib/host/inject-recall.js` 共用同一个导出。
+
+### V14.3 `personas.json` 损坏：先备份再继续可用
+
+**产品策略（主人拍板）**：不是拒绝写盘，而是**备份后保持面板可用**。
+
+- `readJsonSync` 必须区分「读不到」与「内容损坏」：`ENOENT` 静默（正常态），
+  文件在但非合法 JSON 时 `warn` 一次（与异步 `readJsonRaw` 对齐，两条路径共用同一条
+  去重登记，同一份损坏文件只报一条）。
+- 检测到损坏时，先把原文同步写一份 `<personasPath>.corrupt-<UTC 时间戳>-<4 位 hex>`，
+  时间戳口径复用 `store-normalize.js` 的 `snapshotStamp`（`20261110T072233Z`，
+  与 `history/` 快照一致）。**随机后缀是必需的**：时间戳只到秒，同一秒内注册表被改坏两次
+  会撞名，而 `writeFileSync` 默认覆盖——实测过，第一份证据会被静默顶掉。
+  **备份失败只 warn、绝不阻断启动**。
+- **只备份一次**：按「原始损坏文本的 sha1」去重，不按「目录里有没有 `.corrupt-*`」——
+  后者会漏掉「文件被改成另一份损坏内容」这种另一次事故。
+- 备份之后仍走「内存空表 + 后续可写」路径，允许覆盖。**备份是这条策略下唯一的挽回手段**，
+  不许因为「反正会覆盖」而省掉。
+
+### V14.4 `usage.json` 写入失败必须清理临时文件
+
+`lib/host/usage.js` 的 `defaultWriteFile` 与 `lib/core/store.js` 的 `writeAtomic` 同构：
+`rename` 失败时 `unlink(tmp)` 后再抛。清理只放在 catch 分支——`rename` 成功后 tmp 已不存在，
+此时误删目标路径就是删掉刚写好的正式文件。
+
+### V14.5 测试归属（v14）
+
+| 测试文件 | 守什么 |
+|---|---|
+| `test/recall-prefetch.test.js` | payload 主路径命中、宿主注入事件不顶替、无 messages 时日志降级、payload 无 user 消息时不误判、`MAX_LOOKBACK = 256` 与上限仍有界 |
+| `test/store.test.js` | 损坏 → 生成 `.corrupt-<时间戳>` 备份且内容逐字等于原文、原文件允许覆盖、有 warn、只备份一次、ENOENT 与空文件不备份不告警 |
+| `test/usage.test.js` | rename 失败不留 `.tmp`、成功路径不误删目标文件 |
+
+---
+
+## V15 存档口径与热度记账（v15）
+
+本节优先于前文，冲突处以本节为准。两项均来自 `A 类自省审查` 的实证结论；
+**不改任何预算、不压缩任何注入文本**。
+
+### V15.1 `source.sections` 必须反映实际注入，不是原始文档
+
+**问题**：`lib/host/inject.js` 的 `buildSectionList(bodies)` 直接对 `docBody()` 产物
+`escapeFrame`，**没经过预算裁剪**；而真正进入 `session.text` 的是 `buildTieredSnapshot`
+降级链跑完的 `parts.body`。实测偏差（预算档 → 存档 / 实际 / 差值）：
+
+| injectMaxBytes | 存档（旧） | 实际注入 | 偏差 |
+|---|---|---|---|
+| 24000（不降级） | 17160 | 10633 | +6527 |
+| 6000（降级） | 17160 | 5503 | +11657 |
+| 2000（深度降级） | 17160 | 1851 | **+15309** |
+
+61 个真实会话、71 条快照事件里，`source.sections` 合计 681 828 字节，是真实 `content`
+的 **1.60 倍**。排障时按它判断「模型看到了多少」会严重高估。
+
+**修法（选项 A，向下兼容）**：
+
+- `buildTieredSnapshot` **新增**返回键
+  `rendered: { global: string, project: string }`——**裁剪后**、真正进入 `text` 的两段
+  正文（不含段标题、**不做 `escapeFrame`**）。某段被整段裁掉时为空串。
+  `global` 从不被预算裁剪（不变量二），其值恒等于 `globalBody`。
+- `buildSectionList(bodies, rendered)` **首选 `rendered`**；取不到时退回 `bodies`。
+  **退回是兼容退路，不是首选**：服务 v7 回滚通道（`buildSnapshot` 没有 `rendered`）、
+  老渲染层实现与手工构造 snapshot 的测试替身。退回会让存档大于实际注入，但**不许报错**
+  ——一个观测字段的精度不该让整轮注入失败。
+- **转义只在这里做一次**：`rendered` 与 `bodies` 两条路径都过同一个 `escapeFrame`。
+  写在两处必然漂移，且 `rendered` 本身刻意保留原文。
+- `sections` 数字表（`byteSections`）口径不变，仍是「段渲染后字节数（含标题）」，
+  与 `rendered` 同源：`sections.global === byteLength('## 全局长期记忆 (global)\n\n' + rendered.global)`。
+
+**`v7` 回滚通道的已知代价**：`tieredInjection: false` 时没有 `rendered`，存档退回全量
+原文，可能与实际注入不等。这是刻意保留的兼容退路，`byteSections` 仍是真值。
+
+### V15.2 热度只在「真写入」且「id 集合变化」时记一笔
+
+**问题**：记账动作原本在 `composeSnapshot` 内部、**早于**两道写入闸：digest 未变 → 不写，
+`shouldDeferRewrite` → 延后写。判据又是 `swap || held || dropped.length > 0`，于是冷却期内
+`dropped` 非空 → 热度 +1，而同一轮快照一个字没重写、注入内容与上轮完全相同。
+这与同文件注释「集合没变就不该再记一笔」自相矛盾。
+
+**裁决（Lead 定，实现按此）**：
+
+> 热度只在「本轮**实际写入了快照**」且「本轮注入的 id 集合**与上轮不同**」时记一笔。
+
+落地方式：
+
+1. `composeSnapshot` 不再记账，改为返回 `usageKeys: { topics, entries }`
+   （本轮真正进上下文的条目键；无预取时两数组皆空）。它只回答「进了哪些」，不回答
+   「该不该记账」——后者依赖它看不到的两道闸。
+2. pre-step 里新增唯一记账点 `recordRecallHeat(wrote)`，在两处写入分支调用：
+   首次注入（交给宿主落盘，视为写入成功）、`replaceSnapshot(message)`（用它的
+   **返回值**作为是否真写入的判据——`hasSystemHead` 兜底跳过时返回 `false`）。
+3. 判据只有两条，**不看 `decideRecallSwap` 的结局**：
+   - `wrote !== true` → 不记；
+   - `sameIdSet(built.recall.ids, old.source.recall.ids)` → 不记（复用注入层既有函数，
+     不另立集合比较口径）。
+
+**四种结局在新口径下的落点**（判据仍是上面两条，这里只是核对）：
+
+| `decideRecallSwap` 结局 | ids 是否变 | 是否写快照 | 记不记 |
+|---|---|---|---|
+| `swap` 真换血 | 变了 | 会（digest 含 recall id 集合） | **记** |
+| `held` 无候选、沿用上轮 | 未变 | 通常不写 | **不记** |
+| `held` 但上轮 recall 缺席/被裁、本轮重新回填成功 | 从空变有 | 会写 | **记**（唯一判据自然覆盖，不需要特判） |
+| cooling 候选被挡回、沿用上轮 | 未变 | 通常不写 | **不记**（旧 `dropped.length > 0` 判据错在这里） |
+| 一致（候选与上轮完全相同） | 未变 | 不写 | **不记** |
+
+**因此 `held` 不需要特判**：它的两种子情形（没写 / 写了且集合从空到有）恰好落在这两条
+判据的两侧。「是否真写了快照 + id 集合是否变化」是充分且必要的唯一判据。
+
+### V15.3 测试归属（v15）
+
+| 测试文件 | 守什么 |
+|---|---|
+| `test/render-tiered.test.js` | `rendered` 预算充足时与原文一致、降级时小于原文且确实进 `text`、全空时为两空串、`rendered` 不转义而 `text` 已转义 |
+| `test/host-install.test.js` | `sections` 合计 ≤ 整条消息正文、降级档 `sections` 显著小于原始文档（判别「是否又退回存全量」）、v7 回滚通道降级不抛错且段结构完整 |
+| `test/injection-trigger.test.js` | `sections` 段文本逐字出现在注入正文里、合计不超过实际注入 |
+| `test/recall-prefetch.test.js` | 真换血记一笔 / 集合未变不记、cooling 挡回不记、held 且正文未变不记、recall-only 延后时记账不执行 |
+
+---
+
+## V16 实测后暂缓的两项性能优化（v16，主人裁决：先记录不实施）
+
+2026-11-19 自省审查提出两项性能优化，Lead 实测后判定**当前不实施**。本节把「为什么不做」和「什么时候该回来做」固定下来，避免以后有人把它当成遗漏项反复重提，也避免有人不了解风险就顺手改掉。
+
+**共同前提**：两项的收益都是「省 CPU / IO」，**不省注入 token**。用户已明确「不该压的地方不要乱压，免得功能失效」——本节两项都不涉及 token 压缩，纯属性能。
+
+### V16.1 项目段每轮被渲染两次（B1）
+
+- **现状**：`lib/host/inject.js` 的 `composeSnapshot` 先调一次 `buildProjectSection()` **只为取 `overflow`**（用于预取候选过滤 `entry.tier === 'core' || overflow.has(entry.id)`），而 `lib/core/snapshot-tiered.js` 的 `buildTieredSnapshot` 内部又调一次 `renderProjectParts()` 渲染同一份正文。
+- **实测**（Lead，`project-memory.md` 17 089 B）：单次 `buildProjectSection` 0.631 ms，单次 `buildTieredSnapshot`（内含一次渲染）0.705 ms——外层那次重复渲染占 89.5% 的渲染耗时，但**绝对值只有 0.63 ms/轮**。
+- **修法（若将来要做）**：`renderProjectParts` 已经算出 `overflow`（`lib/core/render-tiered.js` 的返回值里就有），只需让 `buildTieredSnapshot` 把它一并传出，外层就不用再调一次。属「算都算了别扔」，技术上零风险。
+- **为什么现在不做**：占比听着吓人，基数只有 0.7 ms，一轮对话以秒计，用户感知为零。更关键的是**时序**——预取（A1）刚在 v14 修好、尚未在真实环境验证，而 `overflow` 口径正是预取候选过滤的输入。此时改它等于给未验证的功能同时引入变量。
+- **回来的条件**：注入链路在真实环境稳定运行、且观测到 pre-step 耗时成为瓶颈；或 `project-memory.md` 增长到数百 KB 使渲染进入毫秒级两位数。实施时必须验证 `overflow` 口径与旧路径**逐条一致**（预取候选集合不变）。
+
+### V16.2 项目文档每轮绕过 store 缓存全量读盘（B2）
+
+- **现状**：`lib/host/tools-search.js` 的 `createProjectDocReader` 用 `store.listProjectDocs()` 只拿文件名，正文走裸 `readFile`，**不经过 `lib/core/store.js` 的 mtime 缓存**（`cache` / `readDoc` 那套）。该 reader 同时服务预取注入（`lib/host/inject.js`）与 `memory search`（`lib/host/tools.js`），两条路径都「永远读最新」。
+- **实测**（Lead，`.dsh/memory/` 两个 md 共 28.7 KB）：稳态 0.7 ms/轮，首轮 2.8 ms（含 store 初始化）。
+- **修法（若将来要做）**：正文读取改走 `store.readDoc`，复用 mtime 缓存。
+- **为什么现在不做（风险高于 B1）**：`store.readDoc` 有 **mtime 缓存**，缓存失效判定一旦出问题（同一毫秒内改文件、NFS 时间戳精度、容器挂载时钟漂移），模型会读到**过期记忆**。这类缺陷极难复现、只在特定文件系统上偶发，而后果是注入错误的历史事实——比 B1 最坏的「慢 0.6 ms」严重得多。此外这是**语义变更**（从「永远读最新」变成「可能读缓存」），不只是性能优化，且一次改动同时影响预取与检索两条用户可见路径。
+- **回来的条件**：记忆目录体积增长到读盘成为可观测瓶颈（如数百 KB 且每轮多次读取）；实施时必须先补一条「文件在缓存有效期内被外部修改 → 读到新内容」的守护用例，并明确 mtime 同名毫秒的兜底策略。
+
+### V16.3 裁决与守则
+
+- 两项**均未实施**，当前代码保持原状。任何一项开工前必须先回来读本节，并说明「V16 里的回来的条件是否已经成立」。
+- **禁止**把这两项当成「顺手优化」混在其他改动里提交：B1 会动预取的 `overflow` 输入，B2 会动两条用户可见的读取语义，都必须独立验收。
+- 本节优先级低于功能正确性：v14/v15 修完的是真实 bug，本节是锦上添花。
