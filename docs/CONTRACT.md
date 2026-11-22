@@ -4163,7 +4163,7 @@ NONE 会被静默推迟一轮才生效，语义上等同于「沿用上轮」。
 | `recallFilterEnabled` | `true` | — | 筛选器总开关。`false` 退回纯字面检索（既有行为） |
 | `recallFilterProvider` | `''` | — | 筛选器路由 provider。与 model 同时非空才生效 |
 | `recallFilterModel` | `''` | — | 筛选器路由 model |
-| `recallFilterTimeoutMs` | `5000` | 500 | 超时毫秒。pre-step 是阻塞的，绝不能无限等 |
+| `recallFilterTimeoutMs` | `30000` | 500 | 超时毫秒。pre-step 是阻塞的，绝不能无限等。**默认 30 秒而不是 5 秒**：筛选器是旁路优化，误判超时会让整轮降级字面检索、召回直接失效，而多等几秒只是慢一点——宁可多等，也不要白降级 |
 | `recallFilterCacheSize` | `32` | 0 | LRU 容量；**0 是合法值**（不缓存），负数是非法值 |
 
 调整 3 项默认值：

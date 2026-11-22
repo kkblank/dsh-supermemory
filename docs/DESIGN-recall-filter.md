@@ -85,7 +85,7 @@ agent/pre-step
 ┌─────────────────────────────────────────┐
 │ recallFilter.select(问题, 候选池)        │
 │   ① 缓存命中？→ 直接用                   │
-│   ② 调模型（超时 5s）                    │
+│   ② 调模型（超时 30s）                   │
 │   ③ 成功 → 返回 ids                      │
 │   ④ 失败 → 返回 fallback 标记            │
 └─────────────────────────────────────────┘
@@ -247,7 +247,7 @@ recallFilterEnabled: z.boolean().default(true).volatile(),
 recallFilterProvider: z.string().default('').volatile(),
 recallFilterModel: z.string().default('').volatile(),
 /** 超时（毫秒）。pre-step 是阻塞的，绝不能无限等。 */
-recallFilterTimeoutMs: z.number().default(5000).volatile(),
+recallFilterTimeoutMs: z.number().default(30000).volatile(),
 /** 缓存容量（按 query + 条目指纹哈希）。 */
 recallFilterCacheSize: z.number().default(32).volatile(),
 ```
@@ -514,7 +514,7 @@ recallFilter: {
 
 | 风险 | 影响 | 对策 |
 |---|---|---|
-| 筛选器慢导致每轮卡顿 | 体验差 | 5s 超时 + 缓存 + 用户可关思考模式 |
+| 筛选器慢导致每轮卡顿 | 体验差 | 30s 超时（宁可多等也不白降级）+ 缓存 + 用户可关思考模式 |
 | 模型服务挂掉 | 失忆 | 自动回退字面检索 |
 | 模型幻觉出不存在的 id | 注入错误内容 | 白名单过滤 + 全幻觉则回退 |
 | 条目正文注入攻击 | 提示词被劫持 | 转义 + 明确标注为数据 |
