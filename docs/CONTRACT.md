@@ -1874,24 +1874,46 @@ append 完 `system/message` 之后、构造请求之前，会把其中非 `runti
 实测 soul + user ≈ 5 KB，现在**同时**在 `systemPrompt` 的 `supermemory:persona` 和快照里各存
 一份，每轮白烧 5 KB。
 
-- pre-step 不再读 soul / user，只读 `global` 与 `project`。
+- pre-step 不再读 soul / user，只读 `project`（v17 起 global 也移出 pre-step，见下方）。
 - soul / user 的**唯一出口**是 `systemPrompt.section`；超预算由 `buildPersonaSection` 现有的
   「先保 soul 再截 user」负责，`systemPromptMaxBytes`（12000）不变。
-- 快照的 `source.sections` / `byteSections` 随之只含 `global` / `project`。**面板按 `sections`
-  渲染的分支要跟着验一遍**（`lib/client.js`，D 负责）。
-- `buildEmptySnapshotMessage` 的 `byteSections` 同步成两键。
+- 快照的 `source.sections` / `byteSections` 只含 `project`（v8 时是 `global` / `project` 两键，
+  v17 起 global 也迁到系统提示词）。**面板按 `sections` 渲染的分支要跟着验一遍**
+  （`lib/client.js`，D 负责）。
+- `buildEmptySnapshotMessage` 的 `byteSections` 同步成单键 `{ project: 0 }`。
+
+**v17 追加（优先于上面三条的措辞）**：global 也改走 `systemPrompt.section`，section 名
+`supermemory:global`、`order: 105`（persona 是 100、experts 是 110）、`interpolate: false`。
+渲染由 `lib/core/render.js` 新增的 `buildGlobalSection({ global, maxBytes })` 负责，输出
+`## 全局长期记忆 (global)\n\n<escapeFrame(正文)>`；正文为空/空白返回 `''`。
+
+- 门控必须与 persona section **逐条一致**（`config.enabled === false` → `''`、
+  `deps.isEnabled?.() === false` → `''`、`memoryInjectionOf(agent) === 'none'` → `''`），
+  人设解析复用同一个 `resolvePersonaOf`，不许另写一套。
+- 独立预算 `systemPromptGlobalMaxBytes`（默认 6000，下限 512），**只用于告警观测**：
+  超预算 `logger.warn` 一次，但仍**全量注入**，不裁剪、不截断（不变量二）。
+  `buildGlobalSection` 是纯函数、不持有 logger，所以告警落在调用方（`lib/host/inject.js`）。
+- `warmPersonaCache` 必须把 `global` 一起预热（`readDoc({ kind: 'global', persona })`）。
+  `store.readDocSync` **只读进程内缓存、不读盘**，漏预热会让冷启动后首次会话的
+  global 记忆整段消失，且只在进程重启后复现。
+- `SNAPSHOT_SCOPES` 收窄为 `['project']`，`EMPTY_BYTE_SECTIONS` 收窄为 `{ project: 0 }`，
+  `attributeRewrite` 的维度比较从五维改成四维（去掉 `global`，保留 `recall`）。
+- **v7 回滚路径（`tieredInjection: false`）同样只传 project**：`buildSnapshot` 函数本身一字未改，
+  但调用方不传 global——否则会系统提示词一次、快照一次，重复注入。
 
 ### V8.1.2 降级从全量改为段级（`lib/core/render.js`）
 
 `buildSnapshot` 今天超限就把所有段换成索引（`truncated: true`）。改成按序收敛：
 
 1. 全量；
-2. 装不下 → project 段收缩（v8.2 后 = core 正文 + 目录；v8.1 阶段 = 直接走目录），
-   **`global` 仍逐字全量**；
+2. 装不下 → project 段收缩（v8.2 后 = core 正文 + 目录；v8.1 阶段 = 直接走目录）；
 3. 仍装不下 → 砍目录条数，保住固定提示行与合法包裹（复用 `fitWrappedIndex` 的优先级）。
 
 `soul` / `user` / `global` **永不被降级**。`fingerprint` 仍对原始正文取哈希（v3 注释里
 "降级后索引相同会误判没变"的理由继续成立）。
+
+**v17 修正**：这条降级链现在只作用于快照侧的 project 段——global 已不在快照里，
+它的「永不降级」由系统提示词侧的 `systemPromptGlobalMaxBytes`（告警不截断）承担。
 
 ## V8.2 条目格式：`tier` 与 `topic`（`lib/core/document.js`，A 负责）
 
@@ -1966,8 +1988,14 @@ buildProjectSection({ text, projectName, usage, coreMaxBytes, indexMaxBytes })
 // → { text, coreCount, coldCount, topics, overflow, bytes }
 buildTieredSnapshot({ global, projectText, projectName, usage, recall,
                       injectMaxBytes, coreMaxBytes, indexMaxBytes, recallMaxBytes })
-// → { text, digest, truncated, sections, stats }
+// → { text, digest, truncated, sections, parts, rendered, stats }
 ```
+
+**v17 修正**：`buildTieredSnapshot` 不再渲染 global 段。入参 `global` 为兼容签名而保留
+（§V8.4 的签名约定 + 多处测试替身会传它），但**不得静默忽略**——传了非空 global 会
+`input.logger?.warn?.()` 告警一次，说明「global 已迁移到系统提示词，此入参被忽略」。
+返回值的 `sections` / `rendered` / `parts` 同步去掉 `global` 键（`sections` 只剩
+`{ project }`，`rendered` 只剩 `{ project }`，`parts` 只剩四维）。
 
 `buildProjectSection` 的算法（顺序固定）：
 
@@ -1978,11 +2006,12 @@ buildTieredSnapshot({ global, projectText, projectName, usage, recall,
 4. 目录段：每主题一行 `- 主题（N条）：摘要 → 别名`，累加到 `indexMaxBytes` 为止，溢出砍主题数。
 5. 结尾固定一行：`冷层条目用 memory 工具按需检索（action=search, scope=project）。`
 
-`buildTieredSnapshot` 的 `digest` 必须覆盖**原始 global 正文 + project 原文 + projectName +
-truncated + 预取命中 id 集合**。预取 id 集合不进 digest 的后果：预取换了条目但快照不重写，
-本轮检索白做。
+`buildTieredSnapshot` 的 `digest` 必须覆盖**project 原文 + projectName + truncated + 预取命中
+id 集合**。预取 id 集合不进 digest 的后果：预取换了条目但快照不重写，本轮检索白做。
+（v17 起 `global` 正文**不再进 digest**——它已不在快照里，留在指纹里会让 global 抖动连带
+触发快照重写，那正是本版要根除的问题。）
 
-`sections` 字节口径保持"每段渲染后字节数"。
+`sections` 字节口径保持"每段渲染后字节数"（v17 起只有 project 一段）。
 
 ## V8.5 配置（`lib/host/config.js`，Lead 负责）
 
@@ -2153,13 +2182,13 @@ core 段该收缩的时机是「总量逼近 `injectMaxBytes`」，不是「超�
 |---|---|---|
 | `document-tier.test.js` | A | 五段头解析、缺省 core、非法值退回、派生 tier 不落盘、往返幂等、`{...entry}` 丢 id/tier 的既有约定不破 |
 | `topics-index.test.js` | A | 围栏解析/生成/插入，preamble 其余内容逐字不变，用户手删围栏后不炸 |
-| `render-tiered.test.js` | A | core/目录预算分配、core 溢出折进目录、`tieredInjection:false` 逐字节退回旧输出、**段级独立降级：project 超预算时 global 正文必须逐字在场** |
+| `render-tiered.test.js` | A | core/目录预算分配、core 溢出折进目录、`tieredInjection:false` 逐字节退回旧输出、**段级独立降级：project 超预算时只降 project**（v17 起 global 不在快照里，改由 §V8.1.1 的 global section 承担） |
 | `search-extended.test.js` | B | 跨 md 检索命中 pitfalls、排除 `history/`、中文长尾召回、**输出 schema 覆盖每一个返回键** |
 | `recall-prefetch.test.js` | B | 无输入跳过、空命中不发标题、id 集合不变不重写、冷却期内不换血、快照仍经 `decision.messages` 由宿主提交 |
 | `usage.test.js` | B | 损坏/缺失当空、topic 计数在条目 id 变更后仍延续、写失败只 warn |
 | `store-project-docs.test.js` | C | 枚举排除 `history/`、目录不存在返回空、排序稳定 |
 | `consolidate-tier.test.js` | C | 三键解析、缺省不动、非法 tier 进 suspects、orphanTopics、落盘顺序 |
-| `client-tier.test.js` | D | 分层概览渲染、`sections` 只剩两键时不崩 |
+| `client-tier.test.js` | D | 分层概览渲染、`sections` 键数变化时不崩（v17 起只剩 project 一键） |
 
 夹具三条铁律（V7.3 + 踩坑第 8 节，v8 继续适用）：必须复刻宿主的 `decision.messages` 提交动作；
 session 桩必须预置 `system/message` 占 `events[0]`；假数据必须与真实落盘结构完全一致。
@@ -2267,10 +2296,14 @@ v8.1.2 把降级形态从「全量索引」改成「core 正文 + 主题目录�
 
 ### 10. 极端预算下允许超出总预算（批准）
 
-`global` 逐字在场、`</supermemory>` 包裹合法，两者都**优先于** `injectMaxBytes`。
-因此 global 自己就超预算时快照会超出总额。收敛顺序固定为：
+`</supermemory>` 包裹合法**优先于** `injectMaxBytes`，所以 project 段最小档（只剩固定提示行）
+仍放不下时，快照会超出总额。收敛顺序固定为：
 全量 → 重算 project 预算（core / 目录三七开）→ 逐条砍主题 → project 段只剩固定提示行。
 **宁可整段超出，也不做会切断 `</supermemory>` 的字节截断。**
+
+**v17 修正**：本条原本还有「`global` 逐字在场」这一半，现在那半已迁到系统提示词侧——
+快照里不再有 global，它的「永不降级」由 `systemPromptGlobalMaxBytes` 的告警不截断语义承担
+（见 §V8.1.1）。快照侧只剩 project 的降级链。
 
 ### 11. `buildProjectSection.text` 的返回口径（接线必读）
 
@@ -2387,11 +2420,13 @@ D 提出面板拿不到 `recallCount` / `recallBytes`（渲染层 `stats` 里有
 事件顶层 = { type, seq, time, data, sourceEventSeqs, surfaceOp }
 data.source = { kind, form, digest, truncated, sections, byteSections, recall? }
                                         ↑ 数组          ↑ 对象
-sections: [{ name: 'global', text: '…' }, { name: 'project', text: '…' }]
+sections: [{ name: 'global', text: '…' }, { name: 'project', text: '…' }]   ← v8 时的形态
+sections: [{ name: 'project', text: '…' }]                              ← v17 起的形态
 ```
 
 - `sections` 是**数组**，元素字段名是 `name`；取项目段要 `sections.find(s => s.name === 'project')`，
-  **`sections.project` 是 `undefined`**。`byteSections` 才是对象，分层后只有 `global`/`project` 两键。
+  **`sections.project` 是 `undefined`**。`byteSections` 才是对象；v17 起只剩 `project` 一键
+  （v8 时是 `global`/`project` 两键，global 已迁到系统提示词）。
 - replace 信息在**顶层 `surfaceOp`**，不在 `data` 里：`surfaceOp: { op: 'replace', startSeq, endSeq }`。
   **读错这一处会把完全正常的会话误判成「恒一条防线失效」**——Lead 按 `data.op` 读时，
   曾看到"7 条快照全 append、同 digest 写两次"并差点上报事故。
@@ -2529,7 +2564,8 @@ core 该留哪几条、有几条被折进目录、各段多少字节，全都可
   `indexBytes` / `totalBytes` / `budget.core` / `budget.index` / `injectUnknown`）四处全删。
 
 **要观测真实注入了多少，唯一可信的途径是看那一轮的注入文本本身**（快照的
-`byteSections.global` / `byteSections.project` 是落盘那一刻的真值，但它只有两段总计）。
+`byteSections` 是落盘那一刻的真值，但它只有各段总计；v17 起只剩 `byteSections.project`，
+global 的字节数不在快照里，超预算只体现在 `logger.warn`）。
 不要再把「盘上文件多大」当成「上下文吃多少」——分层之后两者本来就不等。
 
 ### 2. 仍然保留的（同一裁决，明确不删）
@@ -2548,7 +2584,8 @@ core 该留哪几条、有几条被折进目录、各段多少字节，全都可
 
 - **「注入」条**：`used = soul + user + global + project 四个文件字节之和`，`total = injectMaxBytes`。
   口径错误是结构性的——`soul`/`user` 走 systemPrompt 的 section、吃 `systemPromptMaxBytes`；
-  `global`/`project` 走记忆快照、吃 `injectMaxBytes`。**两个预算下的内容不能相加再除以其中一个**。
+  `project` 走记忆快照、吃 `injectMaxBytes`（v17 前 `global` 也在快照里，之后它迁到
+  `supermemory:global` section）。**三个预算下的内容不能相加再除以其中一个**。
   它同时也是「盘上文件大小」，而分层之后盘上大小 ≠ 注入量（冷层条目只进目录）。
 - **「人格」条**：`used = soul.md 的文件字节`，`total = systemPromptMaxBytes`。真实的人格 section
   是 `buildPersonaSection({ soul, user })` 的输出，**含整个用户画像段和两个段标题**；
@@ -2954,9 +2991,13 @@ surface 上」也判成需要补偿，于是白写一条 `replace` 事件——�
 
 ### V12.2 快照重写归因（`lib/core/snapshot-tiered.js` + `lib/host/inject.js`）
 
-`buildTieredSnapshot` 额外返回 `parts`：五维短指纹
-`{ global, project, projectName, truncated, recall }`（各 8 位 sha1；`truncated` 为可读的
+`buildTieredSnapshot` 额外返回 `parts`：四维短指纹
+`{ project, projectName, truncated, recall }`（各 8 位 sha1；`truncated` 为可读的
 `'true'/'false'`）。**`parts` 不参与 `digest` 计算**，只供归因比对。
+
+v17 起 `global` 维度已移除：global 不在快照里，留在比较里会让「global 变了但快照内容没变」
+也报出一条无法解释的 content 重写。**`recall` 维度必须保留**——它不进 digest 之外还得进归因，
+否则「预取换了条目」会归因成「什么都没变」。
 
 `attributeRewrite(prevSource, nextSnapshot, needsResync)` 返回 `{ reason, changed }`：
 
@@ -2964,10 +3005,10 @@ surface 上」也判成需要补偿，于是白写一条 `replace` 事件——�
 |---|---|
 | `first` | 首次写入 |
 | `resync` | 压缩吞掉快照后的强制重同步（**优先于内容维度判断**） |
-| `content` | 五维中至少一维变化，`changed` 列出具体维度 |
+| `content` | 四维中至少一维变化，`changed` 列出具体维度（取值只会是 `project` / `projectName` / `truncated` / `recall`） |
 | `unknown` | 无 `parts` 可比（升级前的旧快照），不猜 |
 
-快照 `source` 新增两个键：`parts`（五维指纹）与 `rewrite`（本次归因）。
+快照 `source` 新增两个键：`parts`（四维指纹）与 `rewrite`（本次归因）。
 两者**缺省时不落键**，保持旧调用方逐字节不变。
 
 ### V12.3 预取空结果可观测（`lib/host/inject.js`）
@@ -3146,7 +3187,8 @@ surface 上」也判成需要补偿，于是白写一条 `replace` 事件——�
 
 用户只跟「主管人格」对话；主管在系统提示里看到专家目录，用 `delegate_expert` 工具把专业活
 **同步**交给某个专家人格，拿到结论当轮汇报。专家子会话拿到**完整记忆**（soul / user /
-global / project），并且不能再委派（但可以起普通子代理，部署前提见 §V13.11）。
+global / project——v17 起前三者经 `systemPrompt.section`，project 经快照），并且不能再委派
+（但可以起普通子代理，部署前提见 §V13.11）。
 
 ### V13.1 数据模型
 
@@ -3725,9 +3767,9 @@ fork 出来的子代理却能读到主管的整段对话。所以本插件不要
 **修法（选项 A，向下兼容）**：
 
 - `buildTieredSnapshot` **新增**返回键
-  `rendered: { global: string, project: string }`——**裁剪后**、真正进入 `text` 的两段
-  正文（不含段标题、**不做 `escapeFrame`**）。某段被整段裁掉时为空串。
-  `global` 从不被预算裁剪（不变量二），其值恒等于 `globalBody`。
+  `rendered: { project: string }`——**裁剪后**、真正进入 `text` 的正文（不含段标题、
+  **不做 `escapeFrame`**）。被整段裁掉时为空串。
+  （v15 时它还有 `global` 键，v17 起 global 迁到系统提示词，该键随之移除。）
 - `buildSectionList(bodies, rendered)` **首选 `rendered`**；取不到时退回 `bodies`。
   **退回是兼容退路，不是首选**：服务 v7 回滚通道（`buildSnapshot` 没有 `rendered`）、
   老渲染层实现与手工构造 snapshot 的测试替身。退回会让存档大于实际注入，但**不许报错**
@@ -3735,7 +3777,8 @@ fork 出来的子代理却能读到主管的整段对话。所以本插件不要
 - **转义只在这里做一次**：`rendered` 与 `bodies` 两条路径都过同一个 `escapeFrame`。
   写在两处必然漂移，且 `rendered` 本身刻意保留原文。
 - `sections` 数字表（`byteSections`）口径不变，仍是「段渲染后字节数（含标题）」，
-  与 `rendered` 同源：`sections.global === byteLength('## 全局长期记忆 (global)\n\n' + rendered.global)`。
+  与 `rendered` 同源：`sections.project === byteLength('## 项目记忆 (project…)\n\n' + rendered.project)`
+  （v17 起只剩 project 一段）。
 
 **`v7` 回滚通道的已知代价**：`tieredInjection: false` 时没有 `rendered`，存档退回全量
 原文，可能与实际注入不等。这是刻意保留的兼容退路，`byteSections` 仍是真值。
@@ -3815,3 +3858,92 @@ fork 出来的子代理却能读到主管的整段对话。所以本插件不要
 - 两项**均未实施**，当前代码保持原状。任何一项开工前必须先回来读本节，并说明「V16 里的回来的条件是否已经成立」。
 - **禁止**把这两项当成「顺手优化」混在其他改动里提交：B1 会动预取的 `overflow` 输入，B2 会动两条用户可见的读取语义，都必须独立验收。
 - 本节优先级低于功能正确性：v14/v15 修完的是真实 bug，本节是锦上添花。
+
+---
+
+## V17 全局长期记忆迁到系统提示词（v17）
+
+本节优先于前文，冲突处以本节为准。改动只调整 global 的注入出口与预算语义，
+**不动 recall 预取、主题分层与整理器**，也不压缩任何注入文本。
+
+> 版本号说明：代码注释里的 `v17` 就是本节。此前的 `v11` 已被 §V11.0 占用
+> （压缩补偿判据收紧与整编分批降精），两者不是同一件事。
+
+### V17.1 问题：global 跟着 recall 抖动被整条重写
+
+改动前的注入分两个出口：
+
+| 出口 | 内容 | 更新方式 |
+|---|---|---|
+| `systemPrompt.section`（`supermemory:persona`，order 100） | soul + user | 每轮现算，内容稳定 |
+| `agent/pre-step` 的快照消息（`user/message`） | global + project + 本轮预取 | 靠 `surfaceOp: replace` 维持恒为一条 |
+
+实测真实会话的消息顺序是：
+`system/message`(soul+user) → 用户发言 → runtime-context → 快照(global+project) → skill-catalog → time-context。
+
+问题在于**快照会因动态预取（recall）变化被整条 replace**：一旦重写，它之后的所有内容
+（skill-catalog、time-context、以及后续轮次的前缀）缓存全部失效。而 global 几乎不变，
+却跟着 project 一起被重写——**一份稳定的内容被一份抖动的邻居连累了**。
+
+### V17.2 裁决（主人拍板，不再讨论）
+
+分界线：**稳定不变的走系统提示词，可能变的走消息流。**
+
+1. **global 迁到 `systemPrompt.section`**，section 名 `supermemory:global`、`order: 105`
+   （persona 100 / experts 110）、`interpolate: false`。渲染由
+   `lib/core/render.js` 的 `buildGlobalSection({ global, maxBytes })` 负责。
+2. **独立预算 `systemPromptGlobalMaxBytes`，默认 6000，且永不截断。**
+   该预算**只用于告警观测**：超预算 `logger.warn` 一次，但仍全量注入，不裁剪、不截断。
+   这与既有「不变量二：global 永不被降级」完全一致——预算是观测旋钮，不是硬上限。
+3. **不加回退开关。** 不新增 `globalInSystemPrompt: true/false` 之类的配置键，直接改成新行为。
+   既有的 `tieredInjection` 保持原样（它是 v7 渲染路径的回滚通道，**不是**本改动的回滚通道）。
+
+**理由**：避免 recall 抖动导致 global 被连带重写，保护 prompt cache。快照之后的上下文
+往往占一轮的一半以上，为换 2 KB 预取小节而重写整块，代价远高于收益。
+
+### V17.3 落地要点
+
+- `SNAPSHOT_SCOPES` → `['project']`；`EMPTY_BYTE_SECTIONS` → `{ project: 0 }`。
+- `attributeRewrite` 维度从五维改成四维：`['project', 'projectName', 'truncated', 'recall']`。
+  `recall` **必须保留**，否则预取换了条目却归因成「什么都没变」。
+- `tieredFingerprint` 的 payload 与 `tieredFingerprintParts` 同步去掉 `global`。
+- `buildTieredSnapshot` 不再渲染 global 段：删掉 `GLOBAL_HEADING` 与 `globalBlock`，
+  `compose()` 去掉 global 分支，第 2 步降级的 `withoutProject` / `separator` 跟着调整。
+  入参 `global` 保留以维持签名兼容，但**非空时 `logger.warn` 一次**说明已被忽略。
+- `warmPersonaCache` 必须连 `global` 一起预热（`readDoc({ kind: 'global', persona })`）。
+  `store.readDocSync` 只读进程内缓存、不读盘；漏预热会让**冷启动后首次会话的 global
+  记忆整段消失**，且只在进程重启后复现，极难排查。
+- **v7 回滚路径（`tieredInjection: false`）同样只传 project。** `buildSnapshot` 函数本身一字未改，
+  但调用方不传 global——否则系统提示词一次、快照一次，重复注入。
+- 面板（`lib/client.js` + `locale/*.json`）新增只读行 `settings.row.systemPromptGlobalMaxBytes`，
+  中英文案分别是「全局记忆预算（字节）」/「Global memory budget (bytes)」；配置示例补
+  `systemPromptGlobalMaxBytes: 6000`（与 `DEFAULTS` 对账）。
+  `GET bootstrap` 的 `config` 同步带上这个键。
+
+### V17.4 不变量二的执行位置变了，约束本身不变
+
+「global 永不被降级」仍然成立，只是**执行位置从快照侧搬到系统提示词侧**：
+
+| | 改动前 | 改动后 |
+|---|---|---|
+| 执行位置 | `buildTieredSnapshot`（快照里逐字全量） | `supermemory:global` section（超预算仍全量） |
+| 承担语义 | 降级链绕开 global | `systemPromptGlobalMaxBytes` 只告警、不截断 |
+| 可观测 | 快照 `byteSections.global` | `logger.warn` 一条（含实际字节与预算值） |
+
+`buildTieredSnapshot` 的降级注释已同步改写：快照侧只剩 project 的降级链，
+不再有「global 逐字在场」这条描述。
+
+### V17.5 测试归属（v17）
+
+| 测试文件 | 守什么 |
+|---|---|
+| `test/render-digest.test.js` | `buildGlobalSection` 的空正文、段标题措辞、**超预算永不截断**、闭合标签转义、与 `buildPersonaSection`/`buildSnapshot` 互不影响 |
+| `test/host-install.test.js` | `supermemory:global` 的注册形状（name/order 105/interpolate）、正文出现在 section 且不在快照、超预算全量注入且恰好告警一次、未超预算不告警、门控与 persona section 逐条一致（enabled / isEnabled / memoryInjection='none'）、渲染异常降级为空串、按 agent 现算人设、`agent/created` 预热必须含 global |
+| `test/injection-trigger.test.js` | 快照文本与 `byteSections` 都不含 global、v7 回滚路径同样不重复注入、**global 变化不再触发快照重写** |
+| `test/render-tiered.test.js` | 快照里没有 global 段、`sections`/`rendered`/`stats.bytes` 只剩 project、传非空 global 时告警且不渲染、global 不进 digest |
+| `test/rewrite-attribution.test.js` | `parts` 是四维、`changed` 里永不出现 `global` |
+| `test/session-persona-isolation.test.js` | global section 按 agent 现算人设不串台、冷启动预热覆盖 global |
+| `test/config-consolidate.test.js` | `systemPromptGlobalMaxBytes` 默认 6000 / 非法回退 / 下限 512 / 不进 `settings.json` |
+| `test/paths-document.test.js` | `resolveConfig` 全量比对里含新键 |
+| `test/routes.test.js` | `GET bootstrap` 的 `config` 带 `systemPromptGlobalMaxBytes` |
+| `test/client-tier.test.js` | 设置页新行显示真值、缺键落到 `settings.none`（不显示成 0）、词典四处齐备 |
