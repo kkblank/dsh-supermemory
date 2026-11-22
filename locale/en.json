@@ -89,6 +89,10 @@
   "settings.row.tieredInjection": "Tiered injection",
   "settings.row.projectCoreMaxBytes": "Core section budget (bytes)",
   "settings.row.projectIndexMaxBytes": "Topic index budget (bytes)",
+  "settings.recallConfigHint": "These come from the plugin configuration (cordis.patch.yml, set by the operator) and apply only when the panel's recall model is left on Auto; once a model is picked in the panel, the panel wins.",
+  "settings.row.recallFilterEnabled": "Recall filter enabled",
+  "settings.row.recallFilterProvider": "Recall model provider",
+  "settings.row.recallFilterModel": "Recall model",
   "common.on": "On",
   "common.off": "Off",
   "panel.disabledNotice": "Memory is turned off: nothing is injected and nothing is auto-digested. You can still read and edit every memory file here; switch it back on in Settings → Memory.",
@@ -153,6 +157,18 @@
       "modelSaved": "Digest model saved.",
       "modelSaveFailed": "Could not save the digest model: {error}",
       "consolidation": "consolidated: +{added} merged {merged} dropped {dropped} kept {kept}"
+    },
+    "recall": {
+      "enabled": "Recall filter",
+      "model": "Recall model",
+      "modelAuto": "Auto (plugin config or default)",
+      "modelSaved": "Recall model saved",
+      "modelSaveFailed": "Failed to save recall model: {error}",
+      "toggleFailed": "Failed to toggle recall filter: {error}",
+      "disabledHint": "Recall filter off — using literal search",
+      "statsNone": "No timing data yet (no recall run since start)",
+      "stats": "Last run: {ms} ms, {picked} picked ({source})",
+      "statsDegraded": "Last run: {ms} ms, fell back to literal search ({reason})"
     },
     "projectAuto": "Synced from your workspace."
   }

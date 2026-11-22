@@ -89,6 +89,10 @@
   "settings.row.tieredInjection": "分层注入",
   "settings.row.projectCoreMaxBytes": "core 段预算（字节）",
   "settings.row.projectIndexMaxBytes": "主题目录预算（字节）",
+  "settings.recallConfigHint": "以下是插件配置（cordis.patch.yml，运维改），只在面板里「召回模型」留空时生效；面板里选过模型就以面板为准。",
+  "settings.row.recallFilterEnabled": "召回筛选开关",
+  "settings.row.recallFilterProvider": "召回模型 provider",
+  "settings.row.recallFilterModel": "召回模型",
   "common.on": "开启",
   "common.off": "关闭",
   "panel.disabledNotice": "记忆插件已关闭：不再注入人格与记忆快照，也不会自动整理。这里仍可阅读和编辑全部记忆文件；请到「设置 → 记忆」重新开启。",
@@ -153,6 +157,18 @@
       "modelSaved": "整理模型已保存。",
       "modelSaveFailed": "保存整理模型失败：{error}",
       "consolidation": "整编：写入 {added} · 合并 {merged} · 移除 {dropped} · 保留 {kept}"
+    },
+    "recall": {
+      "enabled": "召回筛选",
+      "model": "召回模型",
+      "modelAuto": "自动（插件配置或默认模型）",
+      "modelSaved": "召回模型已保存",
+      "modelSaveFailed": "保存召回模型失败：{error}",
+      "toggleFailed": "切换召回筛选失败：{error}",
+      "disabledHint": "召回筛选已关闭，本轮用字面检索",
+      "statsNone": "暂无耗时数据（进程启动后还未筛选过）",
+      "stats": "最近一次：{ms} ms，选中 {picked} 条（{source}）",
+      "statsDegraded": "最近一次：{ms} ms，已降级字面检索（{reason}）"
     },
     "projectAuto": "已从工作区自动同步。"
   }

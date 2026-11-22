@@ -4150,6 +4150,12 @@ NONE 会被静默推迟一轮才生效，语义上等同于「沿用上轮」。
 
 ### V18.7 配置项与默认值
 
+> **v19 修订**：本节「只从 `cordis.patch.yml` 读，**不进面板 / `settings.json`**」以及下方的
+> 「路由优先级四层」已被 §V19 取代——`recallFilterEnabled` / `recallFilterProvider` /
+> `recallFilterModel` 三项现在也进面板与 `settings.json`，路由改为**三层**（没有会话层）。
+> 本节其余内容（默认值、下限、`recallFilterTimeoutMs` / `recallFilterCacheSize` 仍只走 yml、
+> 调模型参数、缓存 key）继续有效。
+
 新增 5 项（全部 `.volatile()`，只从 `cordis.patch.yml` 读，**不进面板 / `settings.json`**）：
 
 | 键 | 默认 | 下限 | 说明 |
@@ -4176,6 +4182,9 @@ NONE 会被静默推迟一轮才生效，语义上等同于「沿用上轮」。
 2. `deps.currentRoute(agent)` —— `select` 没有 agent 参数，靠 `options.agent` 传入；缺失则跳过本层
 3. `ctx.get('agentDefaultModel')?.currentSelection?.()`
 4. 都拿不到 → `source: 'fallback'`、`reason: 'no-route'`
+
+> **v19 修订**：以上四层改为 §V19.3 的**三层**——新增 `settings.json` 一层（排最前），
+> **撤除**第 2 层 `deps.currentRoute(agent)`。`options.agent` 入参保留以不改调用面，但不再参与路由。
 
 **调模型参数**：`system: SELECT_SYSTEM_PROMPT`、`temperature: 0`（确定性）、
 `maxTokens: 2000`（防推理模型把预算全花在思考上导致正文为空，与 `digest.js` 的
@@ -4226,3 +4235,170 @@ recallFilter: {
 | `test/recall-swap.test.js` | `authoritativeEmpty` 判空清空、缺省逐字不变、严格判等 `true`、`current` 非空时不影响冷却 |
 | `test/injection-trigger.test.js` | 接入层：模型选的条目进快照（字面无关也能选中）、`NONE` 不注入且不降级、筛选失败降级字面记忆不丢、`enabled: false` 与改动前一致且一次模型都不调、`stats.recallFilter` 各形态、**`NONE` 且上轮有预取时预取被清空**、回退字面后仍无命中时沿用上轮 |
 | `test/render-tiered.test.js` | 新默认值（32000 / 12288 / 8）下 21 条 core 全部常驻、预取 8 条大条目时 core 不被挤出、旧 2048 预算的对照、core 全常驻时不发空预取标题 |
+
+---
+
+## V19 召回筛选器的面板入口（v19）
+
+本节优先于 §V18.7 关于「只从 `cordis.patch.yml` 读、不进面板 / `settings.json`」的表述；
+筛选器的判定逻辑、降级矩阵、缓存与提示词全部沿用 §V18，v19 只改**配置入口与可观测性**。
+
+> 版本号说明：代码注释里的 `v19` 就是本节。
+
+### V19.1 动机：v18 的召回模型只能改 yml，普通用户够不着
+
+v18 上线后，召回筛选器的模型唯一配置方式是编辑 `cordis.patch.yml` 的
+`recallFilterProvider` / `recallFilterModel`。这是运维动作，面板上没有任何入口，
+后果是：
+
+| 现象 | 用户看到的 | 真实原因 |
+|---|---|---|
+| 召回变慢、整场对话发卡 | 「插件变慢了」 | 选的模型开着思考模式，每轮阻塞 2~5 秒 |
+| 筛选一直降级成字面检索 | 「召回好像不太准」 | 路由拿不到 / 超时 / 输出格式坏，`source: 'fallback'` |
+| 不知道该选哪个模型 | 无从下手 | 配置项只在 yml 里，且没有耗时反馈 |
+
+v19 补的就是这三件：**面板能选**、**全局统一**、**耗时可见**。
+
+### V19.2 裁决：召回模型全局统一，不跟随会话
+
+整理器保留了「跟随当前会话路由」这一层，召回筛选器**不保留**。两条链路的差异是裁决依据：
+
+| | 整理器 | 召回筛选器 |
+|---|---|---|
+| 频率 | 低频（每 N 轮 / 手动） | **每轮** |
+| 阻塞 | 可异步，失败不阻塞对话 | 在 `agent/pre-step` 里**阻塞**跑 |
+| 可复现要求 | 低（一次结果差可重跑） | **高**（同一份记忆同一句话，召回结果不该随会话漂移） |
+| 结论 | 保留会话路由 | **撤除会话路由** |
+
+于是 v19 起 `select()` 的路由**没有** `deps.currentRoute(agent)` 这一层，面板下拉里也
+**没有**「跟随当前会话」选项（整理模型有，召回模型没有——这是两个选择器唯一的形态差异，
+不要为了「看起来一致」把它加回来）。
+
+### V19.3 路由三层优先级
+
+```
+① settings.json 的 recallFilterProvider / recallFilterModel   ← 面板「召回模型」写这里
+② config（cordis.patch.yml）的 recallFilterProvider / recallFilterModel  ← 运维兜底
+③ ctx.get('agentDefaultModel')?.currentSelection?.()            ← 宿主默认模型
+兜底：都拿不到 → source: 'fallback'、reason: 'no-route'
+```
+
+每层仍要求 **provider 与 model 同时非空**，不跨层拼装（沿用 §V18.7 的规则）。
+**没有会话层**，见 §V19.2。
+
+界面上的分工必须能一眼分清（面板注释与设置页文案都写明了这一点）：
+
+| 位置 | 存在哪 | 谁改 | 何时生效 |
+|---|---|---|---|
+| 面板「召回模型」下拉 | `settings.json` | 用户 | 优先级最高，选了就以它为准 |
+| 设置页三行只读 | `cordis.patch.yml` | 运维 | 仅在面板留空（「自动」）时兜底 |
+
+**开关不走这三层**：`recallFilterEnabled` 的取值应为 `settings.json` 与 `config` 的 **AND**
+（与插件总开关 `enabled` 同一套口径——任一处说关就是关）。理由：yml 里那一项是运维的
+强制关闭手段，面板里那一项是用户偏好，两者都不能被对方静默推翻。
+
+> ⚠️ **实现缺口（批次 E 发现，待后端裁决）**：筛选器判开关读的是 `config.recallFilterEnabled`，
+> 而 `config` 来自 `resolveConfig(cordis.patch.yml)`，**不读 `settings.json`**。于是「面板关掉
+> 开关 → 界面显示已关 → 筛选器仍按 yml 的 `true` 在跑」是可复现的形态，正是本项目反复禁止的
+> 「界面说关了其实没关」。落地方式二选一：筛选器在 `run()` 里额外同步读一次
+> `deps.store.readSettings().recallFilterEnabled` 并取 AND，或由装配层在 `getConfig()` 返回前
+> 合并进去。**不允许只在 `PUT settings` 回显、不接运行时。** 这一条归后端批次，本批次不动代码。
+
+### V19.4 `settings.json` 新增 3 键
+
+| 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `recallFilterEnabled` | boolean | `true` | 召回筛选开关；`false` 退回纯字面检索（与 §V18.4 的 `disabled` 档同义） |
+| `recallFilterProvider` | string | `''` | 召回模型 provider；空 = 交给下一层 |
+| `recallFilterModel` | string | `''` | 召回模型 model；空 = 交给下一层 |
+
+`PUT settings` 接受这三个键，响应体 `digestSettings` 回带全部 6 个键
+（`enabled` / `digestProvider` / `digestModel` / 上面三个）。
+
+`GET models` **不变**：召回模型选择器复用整理模型的同一份列表，不新增接口。
+面板里服务端存着的模型若已不在列表里（下线 / 换 provider），下拉补一个只读项显示当前值，
+否则 `select` 的 `value` 匹配不到任何 `option`，界面会静默显示成第一项「自动」。
+
+### V19.5 `recallFilterStats`：内存态语义
+
+`GET bootstrap` 新增 `recallFilterStats`：
+
+```js
+{
+  source: 'model' | 'cache' | 'fallback',
+  ms: number,          // 最近一次筛选耗时（毫秒）
+  picked: number,      // 选中条目数
+  at: number,          // 时间戳（ms）
+  reason?: string,     // 仅降级时有：disabled/no-route/no-llm/timeout/bad-format/error
+} | null
+```
+
+**它是纯内存态**：进程重启后为 `null`，未跑过筛选时也是 `null`。
+
+面板对 `null` 的处理是**显示「暂无耗时数据（进程启动后还未筛选过）」，不伪造 `0 ms`**。
+理由与本项目既有纪律一致（§V8.11 的「缺一个少画一格，绝不算 0 顶替」）：一个 `0 ms`
+会被读成「筛选瞬间完成」，而事实是「这次没测到」。
+
+### V19.6 面板耗时显示与 2000ms 阈值
+
+耗时文本紧贴模型下拉（`RecallStatsLine`），三种形态：
+
+| 形态 | 条件 | 显示 | 颜色 |
+|---|---|---|---|
+| 关闭 | `recallFilterEnabled === false` | 「召回筛选已关闭，本轮用字面检索」 | 提示色 |
+| 无数据 | `stats === null / undefined` | 「暂无耗时数据…」 | 提示色 |
+| 正常 | `source` 为 `model` / `cache` | 「最近一次：{ms} ms，选中 {picked} 条（{source}）」 | 提示色 |
+| 慢 / 降级 | `ms > 2000` **或** `source === 'fallback'` | 同上 / 降级文案带 `reason` | **警示色** |
+
+**阈值 2000ms 的依据**：v18 实测正常筛选 420~1240ms（关闭思考模式后平均 652ms，见 §V18.1）。
+超过 2 秒说明所选模型偏慢，或者开着思考模式——这两种都会让**每一轮**对话卡一下。
+阈值只用于标黄提示，**不做任何拦截**，也不改超时配置（那是 `recallFilterTimeoutMs` 的事）。
+
+降级（`source === 'fallback'`）即使很快也要标黄：此时召回**没生效**，注入内容悄悄换成了
+字面检索结果——功能还在、不报错、只是「不那么聪明了」，用户必须能看见。
+
+### V19.7 词典键（四处齐备）
+
+`lib/client.js` 内嵌 `en` / `zh` 与 `locale/en.json`、`locale/zh.json` **四处键集合必须完全相等**
+（由 `test/client-tier.test.js` 的 v19 用例守护）：
+
+`panel.recall.enabled` / `.model` / `.modelAuto` / `.modelSaved` / `.modelSaveFailed` /
+`.toggleFailed` / `.disabledHint` / `.statsNone` / `.stats` / `.statsDegraded`，
+`settings.row.recallFilterEnabled` / `.recallFilterProvider` / `.recallFilterModel`，
+外加说明插件配置与面板分工的 `settings.recallConfigHint`。
+
+### V19.8 `writeSettings` 的硬编码修复（真实缺陷）
+
+旧实现把落盘内容**硬编码成三个键**：
+
+```js
+const file = { version: REGISTRY_VERSION, enabled: next.enabled,
+               digestProvider: next.digestProvider, digestModel: next.digestModel }
+```
+
+`next` 是按 `SETTINGS_KEYS` 合并出来的（新键确实进了内存），但写文件时只挑那三个，
+于是**新增的设置键在重启后静默丢失**：界面显示保存成功、`PUT settings` 回带也对，
+下次冷启动又变回默认值。v19 新增三个键正好撞上这个缺陷，所以一并修掉：
+
+```js
+const file = { version: REGISTRY_VERSION }
+for (const key of SETTINGS_KEYS) file[key] = next[key]
+```
+
+落盘改为按 `SETTINGS_KEYS` 动态拼，**新增设置键从此只改常量，不用再动写盘代码**。
+这条属于存储层，实现归后端批次，此处只记录契约。
+
+### V19.9 不做的事（v19 边界）
+
+| 不做 | 理由 |
+|---|---|
+| 召回模型跟随会话 | 每轮阻塞 + 需可复现，见 §V19.2 |
+| 面板里配超时 / 缓存容量 | 那是运维调参，误改会让筛选器整体变慢或降级，留在 yml |
+| 面板显示历史耗时曲线 | 只需要判断「现在这个模型行不行」，一条最近值够了 |
+| 自动测速 / 自动切模型 | 会让召回结果不可复现，且每轮多一次调用 |
+
+### V19.10 测试归属（v19）
+
+| 测试文件 | 守什么 |
+|---|---|
+| `test/client-tier.test.js` | v19 词典 13 键四处齐备；控件组三件同排且下拉无「跟随当前会话」；耗时三态（无数据不伪造 0 / 超 2000ms 标黄 / 降级标黄带 reason）；关闭态下拉禁用；旧服务端缺键按开启；PUT 请求体形状与失败回滚；不在列表里的当前模型补只读项；设置页三行真值与缺键落「无」；配置示例 5 个 `recallFilter*` 与 `DEFAULTS` 逐值一致 |
