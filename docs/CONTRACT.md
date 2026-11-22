@@ -88,7 +88,7 @@ export function resolveConfig(config) -> ResolvedConfig
 | `projectDirName` | string | `'.dsh/memory'` | `projectDirName` |
 | `projectFileName` | string | `'project-memory.md'` | `projectFileName` |
 | `systemPromptMaxBytes` | number | `12000` | `systemPromptMaxBytes` |
-| `injectMaxBytes` | number | `24000` | `injectMaxBytes` |
+| `injectMaxBytes` | number | `32000` | `injectMaxBytes` |
 | `autoDigest` | boolean | `true` | `autoDigest` |
 | `digestEveryTurns` | number | `5` | `digestEveryTurns` |
 | `digestPressureRatio` | number | `0.75` | `digestPressureRatio` |
@@ -2023,13 +2023,14 @@ id 集合**。预取 id 集合不进 digest 的后果：预取换了条目但快
 | `tieredInjection` | `true` | — | 分层总开关；`false` **逐字**退回 v7 渲染路径 |
 | `projectCoreMaxBytes` | `16384` | 1024 | core 段硬预算，见下方「默认值为何留宽」 |
 | `projectIndexMaxBytes` | `3072` | 512 | 目录段硬预算 |
-| `projectRecallMaxBytes` | `2048` | 512 | 预取段硬预算 |
-| `projectRecallTopK` | `5` | 1 | 预取条数 |
+| `projectRecallMaxBytes` | `12288` | 512 | 预取段硬预算（v18：只作安全兜底，见 §V18.6） |
+| `projectRecallTopK` | `8` | 1 | 预取条数 |
 | `projectRecallMinRounds` | `3` | 0 | 预取换血最小间隔（轮） |
 
 **`projectCoreMaxBytes` 默认值为何是 16384 而不是 8192（实测纠正，别再改回去）**：
 真实项目记忆 9 KB / 25 条时，8192 的预算会在 `injectMaxBytes: 24000` 只用了一半的情况下
-把 4 条挤进目录，而目录里只剩「未分类（4条）」一行——**升级当天就净丢信息**。实测数据：
+把 4 条挤进目录，而目录里只剩「未分类（4条）」一行——**升级当天就净丢信息**。实测数据
+（当时的 `injectMaxBytes` 是 24000，v18 已提到 32000，见 §V18.6）：
 
 | coreMaxBytes | 正文条目 | 折进目录 | 结论 |
 |---|---|---|---|
@@ -2228,6 +2229,8 @@ usage:  { topics: {…}, entries: {…} }   // 直接传 usage.json 那个对象
 - `items[].text` 必须走 `escapeFrame` 再拼进快照——预取来的条目正文里只要出现
   `</supermemory>` 就会提前闭合整个包裹。这是 `escapeFrame` 存在的唯一理由，新路径不许绕过。
 - 条数与总字节由渲染层按 `projectRecallTopK` / `projectRecallMaxBytes` 裁，注入层不预裁。
+  （v18 起条数由**筛选器**按 `projectRecallTopK` 选，`projectRecallMaxBytes` 只作安全兜底，
+  见 §V18.6。）
 
 ### 2. 渲染层能力探测（允许，但必须吭声）
 
@@ -3947,3 +3950,279 @@ fork 出来的子代理却能读到主管的整段对话。所以本插件不要
 | `test/paths-document.test.js` | `resolveConfig` 全量比对里含新键 |
 | `test/routes.test.js` | `GET bootstrap` 的 `config` 带 `systemPromptGlobalMaxBytes` |
 | `test/client-tier.test.js` | 设置页新行显示真值、缺键落到 `settings.none`（不显示成 0）、词典四处齐备 |
+
+---
+
+## V18 小模型召回筛选器（v18）
+
+本节优先于前文，冲突处以本节为准。设计背景与实测数据见 `docs/DESIGN-recall-filter.md`。
+改动**只替换「预取选哪些 id」这一步**，其余链路（`decideRecallSwap` / `pickRecallItems` /
+`buildTieredSnapshot` / 渲染 / 指纹）一字不动。
+
+> 版本号说明：代码注释里的 `v18` 就是本节。
+
+### V18.1 动机：字面检索的漏召回缺口
+
+预取原本靠字面匹配：把用户这句话切词，在项目记忆里找字面命中的条目。绕不过去的缺口是
+**记忆条目是事实陈述、用户问题是意图**，两者在字面上常常毫无交集：
+
+| 场景 | 字面检索 | 期望 |
+|---|---|---|
+| 用户问「这个活该谁干」 | 找不到「委托边界」条目（无共同字词） | 应该找到 |
+| 用户问「并行改代码安全吗」 | 找不到「git stash 会丢改动」条目 | 应该找到 |
+| 用户问「重启后记忆怎么没了」 | 找不到「warmPersonaCache 必须预热」条目 | 应该找到 |
+
+实测（真实 21 条 core 记忆 + 6 个真实问题，qwen3.8-flash 做筛选）：**准确率 6/6**，
+延迟 420~1240ms（关闭思考模式后），平均 652ms；「今天天气怎么样」正确返回 `NONE`。
+
+### V18.2 架构：筛选器只替换「选哪些 id」
+
+```
+agent/pre-step
+  ↓
+读项目记忆 → collectEntries()
+  ↓
+过滤（非 core / 被预算挤出正文的 core）→ 候选池
+  ↓
+┌──────────────────────────────────────┐
+│ recallFilter.select(query, pool)     │
+│   ① 开关 → ② 空池 → ③ 缓存 →        │
+│   ④ 路由 → ⑤ 调模型 → ⑥ 解析降级    │
+└──────────────────────────────────────┘
+  ↓
+source === 'fallback' ？→ 回退 searchProjectEntries()（字面检索，在全集上做）
+否则                    → pickRecallItems(pool, ids)（含 ids 为空 = 模型判空）
+  ↓
+decideRecallSwap()【冷却逻辑不变，仅新增 authoritativeEmpty 入参】
+  ↓
+pickRecallItems() 回填【不变】
+  ↓
+buildTieredSnapshot()【不变】
+```
+
+新增两个文件：
+
+| 文件 | 层 | 职责 |
+|---|---|---|
+| `lib/core/recall-select.js` | 纯函数 | `SELECT_SYSTEM_PROMPT` / `buildSelectPrompt` / `parseSelectOutput` / `DEFAULT_MAX_PICK`。不碰磁盘、不碰网络、不调模型 |
+| `lib/host/recall-filter.js` | 宿主 | `createRecallFilter(ctx, deps)` → `{ select, dispose }`。调模型、超时、LRU 缓存、降级判定 |
+
+`select(query, entries, options)` 返回：
+
+```js
+{
+  ids: string[],                    // 按模型给出的顺序（顺序即重要性，不排序）
+  source: 'model' | 'cache' | 'fallback',
+  ms: number,
+  reason?: string,                  // 仅 fallback：disabled / no-route / no-llm / timeout / error / bad-format
+  rejected?: string[],              // 模型给出但条目池里不存在的 id（幻觉，供可观测性）
+}
+```
+
+**实例必须在 `installInjection` 里建一次**（`const recallFilter = createRecallFilter(ctx, deps)`），
+在 `dispose` 里调它的 `dispose`。每轮在 `composeSnapshot` 里新建会让 LRU 缓存命中率恒为 0，
+每轮白花一次阻塞式模型调用。
+
+### V18.3 接入点：`composeSnapshot` 的候选选择
+
+```js
+const pool = query === null || entries.length === 0
+  ? []
+  : entries.filter((entry) => entry.tier !== 'core' || overflow.has(entry.id))
+
+let candidates = []      // 条目对象，不再是 id
+let filterStats
+if (pool.length > 0) {
+  const picked = await recallFilter.select(query, pool, { maxPick: topK, config, agent: input.agent })
+  filterStats = picked
+  if (picked.source === 'fallback') {
+    // 回退字面检索：先按字面打分取 top-K，再套同一套池子判据
+    candidates = searchProjectEntries(docs, { terms: queryTerms(query), limit: topK })
+      .filter((entry) => entry.tier !== 'core' || overflow.has(entry.id))
+  } else {
+    candidates = pickRecallItems(pool, picked.ids)
+  }
+}
+const currentIds = candidates.map((entry) => entry.id)
+```
+
+三条落地要点：
+
+1. **池子与字面检索看同一个判据**（非 core，或被预算挤出正文的 core）。旧代码的
+   `currentIds` 过滤挪到了回退分支里，**不是删掉**——少了它，回退路径会把 core 条目也塞进
+   预取，重复注入且违反 §V8.15 裁决 3。
+2. **`candidates` 从「id 数组」变成「条目对象数组」**。下游 `pickRecallItems(candidates.length === 0
+   ? entries : [...candidates, ...entries], decided.ids)` 原样成立：两种来源产出的都是条目对象，
+   该函数按 id 取第一条匹配，所以「候选优先、全量兜底」的语义不变——**沿用上轮时仍能回填正文**
+   （`decided.ids` 里的条目通常不在本轮候选里，由 `entries` 兜底）。这条不坏，§V8.9 的
+   「重写快照时预取小节不许凭空消失」继续成立。
+3. **`recallSkipReason` 的六种取值全部保留**。`candidates` 变成对象后 `currentIds.length`
+   恒等于 `candidates.length`，所以「有字面命中但一条都不可预取」这一档改用 `literalHits`
+   判断（回退分支与池子为空的分支各记一次字面命中数）：
+   `candidates.length === 0 ? (literalHits === 0 ? 'no-match' : 'no-candidates') : ...`。
+
+`agent` 从 pre-step 调用处经 `input.agent` 传入，只用于筛选器的第 2 层路由
+（`deps.currentRoute(agent)`）；缺失时该层整层跳过。
+
+### V18.4 降级矩阵（完整表）
+
+| 情况 | 行为 | `source` | `reason` | 结果 |
+|---|---|---|---|---|
+| 正常返回 id | 用模型结果 | `model` | — | 注入选中条目 |
+| 正常返回 `NONE` | 注入 0 条，**不回退** | `model` | — | 预取小节不出现 |
+| 缓存命中 | 用缓存结果 | `cache` | — | 同模型结果 |
+| 超时 | **回退字面检索** | `fallback` | `timeout` | 字面命中的条目 |
+| 网络/服务错误 | **回退字面检索** | `fallback` | `error` | 同上 |
+| 输出无法解析 | **回退字面检索** | `fallback` | `bad-format` | 同上 |
+| 返回的 id 全不存在（幻觉） | **回退字面检索** | `fallback` | `bad-format` | 同上（结果不可信） |
+| `llm` 服务缺失 / 无 `stream` | **回退字面检索** | `fallback` | `no-llm` | 同上 |
+| 四层路由都拿不到 | **回退字面检索** | `fallback` | `no-route` | 同上 |
+| 开关 `recallFilterEnabled: false` | 纯字面检索 | `fallback` | `disabled` | 与改动前完全一致 |
+| 候选池为空 | 不问模型 | `model` | — | `ids: []`（没有候选就是没有，不降级） |
+
+**原则：只有「筛选器没给出可信结论」才回退；「筛选器说没有相关记忆」是有效结论。**
+
+两类空结果的语义相反，所以 `none` 是必须的返回字段，不能靠 `ids.length` 推断：
+
+- `parseSelectOutput` 返回 `none: true` → 模型明确拒绝 → `source: 'model'`，**不回退**；
+- `none: false` 且 `ids: []` → 输出不可信（空 / 乱码 / 全幻觉）→ `source: 'fallback'`。
+
+`select` 整体包 try/catch：任何异常都 `logger.warn` + 返回 `reason: 'error'`，**绝不抛到调用方**
+（pre-step 不能被筛选器搞崩）。
+
+### V18.5 `authoritativeEmpty` 裁决：NONE 必须清空而不是沿用上轮
+
+`decideRecallSwap` 有一个既有分支：本轮候选为空、上轮有内容 → 沿用上轮。它的本意是对的
+（字面检索偶尔一个都没匹配到，不该把已注入的记忆清掉），但与「模型返回 NONE → 注入 0 条」
+直接矛盾：模型明确判定「这些都不相关」，`currentIds` 为空，于是走进该分支，**沿用上轮的条目**
+——等于 NONE 被静默推翻。
+
+裁决：区分「候选为空」的两种成因。
+
+| 成因 | `currentIds` | `authoritativeEmpty` | 行为 |
+|---|---|---|---|
+| 字面检索无匹配（噪音） | 空 | 缺省 / false | 沿用上轮（既有行为，保留） |
+| 模型明确返回 NONE | 空 | true | **注入 0 条，清空预取** |
+| 筛选失败后回退字面、字面也无匹配 | 空 | false（`source === 'fallback'`） | 沿用上轮 |
+
+`authoritativeEmpty === true` 时 `decideRecallSwap` 直接返回
+`{ swap: true, ids: [], round, dropped: [], held: false }`。该参数**严格判等 `true`**
+（`'true'` / `1` / 缺省一律按检索噪音处理），且只在 `current` 为空时参与判定，缺省时行为与
+v17 逐字一致。
+
+**⚠️ 第二处「沿用上轮」闸（设计文档 §7.1 未覆盖，实现时发现）**：pre-step 里的
+`shouldDeferRewrite`（契约 §V12.4 的重写延后）同样会推翻 NONE。它的触发条件是「只有 recall
+维度变化、正文一个字没变、且旧快照已有预取」——而模型判空**恰好就是这个形态**。不拦的话
+NONE 会被静默推迟一轮才生效，语义上等同于「沿用上轮」。
+
+处理方式：`composeSnapshot` 把 `authoritativeEmpty` 一并返回，pre-step 里改成
+`if (!built.authoritativeEmpty && shouldDeferRewrite(...))`。两处看**同一个判据**，否则
+「NONE 清空预取」这条决策会从一个闸漏到另一个闸。
+
+### V18.6 只限条数、不做字节决策的理由
+
+改动前有两层限制互相打架：
+
+| 层 | 配置 | 位置 | 行为 |
+|---|---|---|---|
+| 检索侧 | `projectRecallTopK`（旧 5） | `inject.js` | 限候选数量 |
+| 渲染侧 | `projectRecallMaxBytes`（旧 2048） | `snapshot-tiered.js` | 装不下就**静默丢弃** |
+
+实测这个组合的后果：
+
+```
+模型选了 8 条，总字节 8195
+预算 2048B → 实际只注入 1 条      ← 模型白干了
+极端：第一条就 5000B，预算 2048B → 实际注入 0 条，一条都没有
+```
+
+渲染层是「从前往后装，装不下就停」，而模型可能正是按重要性排序的，等于砍掉了最该保留的部分。
+
+新方案：**单一决策点**。
+
+- 筛选器**只限条数**（`projectRecallTopK = 8`），不做字节决策；
+- 渲染层的 `projectRecallMaxBytes` 放宽到 **12288**，只作安全兜底。
+
+实测：`recallMax = 12288` 时 core **20/21 条全部保留**，快照健康。反过来，**完全去掉**字节兜底
+的实测后果是 `recallMax = 无限制 → core 只剩 0/21 条、快照 71KB`：预取段先渲染进 text，
+总字节超限后降级链会去砍 core 正文——8 条预取把 20 条常驻记忆挤掉，方向完全反了。
+所以保留这个很宽的兜底，正常情况永远不触发。
+
+### V18.7 配置项与默认值
+
+新增 5 项（全部 `.volatile()`，只从 `cordis.patch.yml` 读，**不进面板 / `settings.json`**）：
+
+| 键 | 默认 | 下限 | 说明 |
+|---|---|---|---|
+| `recallFilterEnabled` | `true` | — | 筛选器总开关。`false` 退回纯字面检索（既有行为） |
+| `recallFilterProvider` | `''` | — | 筛选器路由 provider。与 model 同时非空才生效 |
+| `recallFilterModel` | `''` | — | 筛选器路由 model |
+| `recallFilterTimeoutMs` | `5000` | 500 | 超时毫秒。pre-step 是阻塞的，绝不能无限等 |
+| `recallFilterCacheSize` | `32` | 0 | LRU 容量；**0 是合法值**（不缓存），负数是非法值 |
+
+调整 3 项默认值：
+
+| 键 | 旧值 | 新值 | 理由 |
+|---|---|---|---|
+| `injectMaxBytes` | 24000 | **32000** | 三段预算都能跑满，不再互相挤压 |
+| `projectRecallMaxBytes` | 2048 | **12288** | 实测该值下 core 完全不受影响；只作安全兜底 |
+| `projectRecallTopK` | 5 | **8** | 模型自然选 3~6 条，留余量 |
+
+不动的：`projectCoreMaxBytes`（16384）、`projectIndexMaxBytes`（3072）、
+`projectRecallMinRounds`（3）。
+
+**路由优先级四层**（与整理器同一套，每层要求 provider 与 model 同时非空，不跨层拼装）：
+1. `config.recallFilterProvider` / `config.recallFilterModel`
+2. `deps.currentRoute(agent)` —— `select` 没有 agent 参数，靠 `options.agent` 传入；缺失则跳过本层
+3. `ctx.get('agentDefaultModel')?.currentSelection?.()`
+4. 都拿不到 → `source: 'fallback'`、`reason: 'no-route'`
+
+**调模型参数**：`system: SELECT_SYSTEM_PROMPT`、`temperature: 0`（确定性）、
+`maxTokens: 2000`（防推理模型把预算全花在思考上导致正文为空，与 `digest.js` 的
+finish reason `'length'` 处理同源）、`signal: AbortSignal.timeout(recallFilterTimeoutMs)`。
+
+**缓存**：key = `sha1(query + '\n' + 条目指纹 + '\n' + maxPick)`，条目指纹 = 按 id 排序后
+逐条拼 `id:正文`（**必须含正文**：条目内容改了 id 常常不变，只按 id 做指纹会让模型一直看到旧内容）。
+LRU 用 `Map` 的插入序实现。**只缓存 `source === 'model'` 的成功结论**，含 `NONE` 的空结果
+（那也是结论，同样的问题不必再问一次）；`fallback` 不缓存——否则服务恢复后还要再错一轮。
+
+### V18.8 可观测性：`snapshot.stats.recallFilter`
+
+```js
+recallFilter: {
+  source: 'model' | 'cache' | 'fallback',
+  ms: 652,
+  picked: 6,
+  reason: 'timeout',         // 仅 fallback 时有；model 结论不落这个键
+  rejected: ['deadbeef'],    // 仅非空时落键（模型幻觉出的 id）
+}
+```
+
+**为什么需要**：本项目既有风格是「每种静默都要能自证」（见 `recallSkipReason` 的六种取值）。
+筛选器一旦降级，注入内容会悄悄换成字面检索的结果——功能还在、不报错、只是「不那么聪明了」，
+没有这份证据就只能靠猜。`picked` 与 `rejected` 还顺便回答「模型是不是在瞎编 id」。
+
+`filterStats === undefined`（候选池为空、筛选器根本没跑）时不落这个键。字段只增不改，
+`stats` 既有形状不动。
+
+### V18.9 不做的事（明确边界）
+
+| 不做 | 理由 |
+|---|---|
+| 引入 embedding / 向量库 | 记忆池小（30 条 / 15KB），模型判断「任务相关」比「语义相似」更贴合需求，且无额外依赖 |
+| 插件内关闭思考模式 | 由用户启动模型时自行控制；插件不感知 provider 能力，避免耦合（用户实测关闭思考后延迟降 8 倍） |
+| 加硬性条目长度截断 | 硬截断会丢关键信息；只在整理提示词里要求「精炼、抓重点」，靠模型自觉 + 长期观察 |
+| 改动 `decideRecallSwap` 的冷却逻辑 | 与本次目标无关，只新增 `authoritativeEmpty` 一个纯增量入参 |
+| 改动 `buildRecallSection` 的渲染算法 | 只放宽预算，不改算法 |
+| 加运行时回退开关 | 筛选器已有 `recallFilterEnabled`，够了 |
+
+### V18.10 测试归属（v18）
+
+| 测试文件 | 守什么 |
+|---|---|
+| `test/recall-select.test.js` | 纯函数层：提示词含全部条目与正文、`</supermemory>` 转义、压行防结构伪造、逗号/换行/空格/JSON/围栏/前缀废话解析、幻觉 id 过滤与 `rejected`、去重保序、`maxPick` 截断、`NONE` → `none: true`、空/乱码 → `none: false` |
+| `test/recall-filter.test.js` | 宿主层：正常返回 `model`、调模型参数（system/temperature 0/maxTokens 2000/signal）、超时 → `timeout`、抛错 → `error` 不抛、乱码 → `bad-format`、全幻觉 → `fallback`、`NONE` → `model` 不降级、`disabled` 短路且一次服务都不取、`no-llm`、`no-route`、空池不调模型、四层路由优先级与半路由跳过、缓存命中/`NONE` 缓存/内容变化失效/容量淘汰/容量 0/`fallback` 不缓存/`maxPick` 进 key、`dispose` 清缓存、`getConfig` 回退与抛错兜底 |
+| `test/recall-filter-config.test.js` | 5 个新键的默认值与归一化、3 个调整后的预算默认值、`SETTINGS_KEYS` 未扩大 |
+| `test/recall-swap.test.js` | `authoritativeEmpty` 判空清空、缺省逐字不变、严格判等 `true`、`current` 非空时不影响冷却 |
+| `test/injection-trigger.test.js` | 接入层：模型选的条目进快照（字面无关也能选中）、`NONE` 不注入且不降级、筛选失败降级字面记忆不丢、`enabled: false` 与改动前一致且一次模型都不调、`stats.recallFilter` 各形态、**`NONE` 且上轮有预取时预取被清空**、回退字面后仍无命中时沿用上轮 |
+| `test/render-tiered.test.js` | 新默认值（32000 / 12288 / 8）下 21 条 core 全部常驻、预取 8 条大条目时 core 不被挤出、旧 2048 预算的对照、core 全常驻时不发空预取标题 |
